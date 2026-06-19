@@ -1,0 +1,15 @@
+# Command Registry
+
+| Command | Path | Purpose | Status |
+|---|---|---|---|
+| repo-audit | `.opencode/commands/repo-audit.md` | Audit repository structure and risks | Active |
+| plan-feature | `.opencode/commands/plan-feature.md` | Plan a feature safely | Active |
+| implement-phase | `.opencode/commands/implement-phase.md` | Implement one planned phase | Active |
+| review-diff | `.opencode/commands/review-diff.md` | Review current diff | Active |
+| security-audit | `.opencode/commands/security-audit.md` | Security-focused audit | Active |
+| pr-summary | `.opencode/commands/pr-summary.md` | Pull request summary | Active |
+| cost-check | `.opencode/commands/cost-check.md` | Model/API cost review | Active |
+| local-benchmark | `.opencode/commands/local-benchmark.md` | Local model benchmark | Active |
+| model-router | `.opencode/commands/model-router.md` | Choose local vs cloud model route | Active |
+| sandbox-start | `.opencode/commands/sandbox-start.md` | Start safe sandbox workflow | Active |
+| memory-update | `.opencode/commands/memory-update.md` | Update project memory | Active |

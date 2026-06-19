@@ -1,0 +1,109 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [],
+  "permission": {
+    "*": "ask",
+    "edit": "ask",
+    "write": "ask",
+    "bash": {
+      "*": "ask",
+      "pwd": "allow",
+      "ls*": "allow",
+      "cat *": "allow",
+      "rg *": "allow",
+      "grep *": "allow",
+      "find *": "allow",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git branch*": "allow",
+      "git show*": "allow",
+      "npm test*": "ask",
+      "npm run test*": "ask",
+      "npm run build*": "ask",
+      "pnpm test*": "ask",
+      "pnpm build*": "ask",
+      "go test*": "ask",
+      "pytest*": "ask",
+      "docker *": "ask",
+      "docker compose *": "ask",
+      "rm *": "deny",
+      "rm -rf *": "deny",
+      "sudo *": "deny",
+      "curl * | sh": "deny",
+      "wget * | sh": "deny",
+      "git push*": "ask",
+      "git reset --hard*": "deny",
+      "git clean*": "deny"
+    },
+    "question": "allow"
+  },
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama Local",
+      "options": {
+        "baseURL": "http://localhost:11434/v1"
+      },
+      "models": {
+        "qwen2.5-coder:7b": {
+          "name": "Qwen 2.5 Coder 7B Local"
+        },
+        "qwen2.5-coder:14b": {
+          "name": "Qwen 2.5 Coder 14B Local"
+        },
+        "qwen2.5-coder:3b": {
+          "name": "Qwen 2.5 Coder 3B Local"
+        }
+      }
+    },
+    "lmstudio": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LM Studio Local",
+      "options": {
+        "baseURL": "http://127.0.0.1:1234/v1"
+      },
+      "models": {
+        "local-coder": {
+          "name": "LM Studio Local Coder"
+        }
+      }
+    }
+  },
+  "mcp": {
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "enabled": true,
+      "timeout": 10000
+    },
+    "github": {
+      "type": "local",
+      "command": [
+        "docker",
+        "run",
+        "-i",
+        "--rm",
+        "-e",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "ghcr.io/github/github-mcp-server"
+      ],
+      "enabled": false,
+      "timeout": 10000
+    },
+    "playwright": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@playwright/mcp@latest"
+      ],
+      "enabled": false,
+      "timeout": 10000
+    }
+  },
+  "tools": {
+    "github_*": false,
+    "playwright_*": false
+  }
+}
