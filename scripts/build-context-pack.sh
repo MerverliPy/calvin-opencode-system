@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# build-context-pack.sh
-# Generates a single Markdown context pack for the Calvin opencode system repository.
-# Intended output:
-#   dist/context-packs/calvin-opencode-system-context-pack.md
-
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 OUTPUT_DIR="$REPO_ROOT/dist/context-packs"
 OUTPUT_FILE="$OUTPUT_DIR/calvin-opencode-system-context-pack.md"
-MAX_FILE_BYTES="${MAX_FILE_BYTES:-1048576}" # 1 MB default per file
+MAX_FILE_BYTES="${MAX_FILE_BYTES:-1048576}"
+
+SENSITIVE_REGEX='(API[_-]?KEY|SECRET|TOKEN|PASSWORD|PRIVATE[[:space:]_-]?KEY|BEGIN [A-Z ]*PRIVATE KEY)'
 
 mkdir -p "$OUTPUT_DIR"
 cd "$REPO_ROOT"
@@ -77,6 +74,7 @@ sanitized_git_status() {
   fi
 
   local printed=0
+
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
 
@@ -115,7 +113,54 @@ collect_files() {
   done | sed 's#^./##' | sort -u
 }
 
+scan_sensitive_patterns() {
+  local file
+  local count=0
+
+  if [[ -z "${file_list:-}" ]]; then
+    echo "No files available for sensitive-pattern scanning."
+    return 0
+  fi
+
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    [[ -f "$file" ]] || continue
+
+    case "$file" in
+      scripts/build-context-pack.sh)
+        continue
+        ;;
+    esac
+
+    if is_binary "$file"; then
+      continue
+    fi
+
+    local size
+    size="$(wc -c < "$file" | tr -d ' ')"
+
+    if (( size > MAX_FILE_BYTES )); then
+      continue
+    fi
+
+    while IFS= read -r match; do
+      [[ -n "$match" ]] || continue
+      echo "- $match"
+      count=$((count + 1))
+    done < <(grep -nEI "$SENSITIVE_REGEX" "$file" 2>/dev/null | sed "s#^#$file:#" || true)
+  done <<< "$file_list"
+
+  if (( count == 0 )); then
+    echo "No sensitive-pattern warnings detected."
+  fi
+}
+
 file_list="$(collect_files)"
+SENSITIVE_REPORT_FILE="$(mktemp)"
+trap 'rm -f "$SENSITIVE_REPORT_FILE"' EXIT
+
+scan_sensitive_patterns > "$SENSITIVE_REPORT_FILE"
+sensitive_warning_count="$(awk '/^- /{c++} END{print c+0}' "$SENSITIVE_REPORT_FILE")"
 
 {
   cat <<HEADER
@@ -128,7 +173,7 @@ Latest commit: \`$commit\`
 
 ## Purpose
 
-This context pack is a clean, uploadable Markdown snapshot of Calvin's private opencode system repository. It is designed for ChatGPT or opencode sessions that need repository context without exposing secrets, model weights, build artifacts, or generated output folders.
+This context pack is a clean, uploadable Markdown snapshot of Calvin's private opencode system repository.
 
 ## Safety Warnings
 
@@ -162,10 +207,26 @@ Files larger than \`$MAX_FILE_BYTES\` bytes are skipped by default.
 
 ---
 
-## Git Status Summary
+## Sensitive Pattern Warning Report
+
+This section flags suspicious terms such as API key, secret, token, password, and private key. These warnings can be false positives when they refer to placeholder environment variable names.
 
 ~~~~text
 HEADER
+
+  cat "$SENSITIVE_REPORT_FILE"
+
+  cat <<STATUS
+~~~~
+
+Sensitive warning count: \`$sensitive_warning_count\`
+
+---
+
+## Git Status Summary
+
+~~~~text
+STATUS
 
   sanitized_git_status
 
@@ -270,3 +331,4 @@ CONTENTS
 echo "Context pack created: $OUTPUT_FILE"
 echo "Included files: $(printf '%s\n' "$file_list" | sed '/^$/d' | wc -l | tr -d ' ')"
 echo "Max file size: $MAX_FILE_BYTES bytes"
+echo "Sensitive pattern warnings: $sensitive_warning_count"
