@@ -49,6 +49,8 @@ Usage:
   ./scripts/opencode-os.sh audit-prep
   ./scripts/opencode-os.sh audit-prep --no-pull
   ./scripts/opencode-os.sh audit-prep --print-prompt
+  ./scripts/opencode-os.sh audit-prep --windows-copy
+  ./scripts/opencode-os.sh audit-prep --clipboard
   ./scripts/opencode-os.sh save-audit path/to/audit-response.md --commit --push
   ./scripts/opencode-os.sh save-audit --stdin --commit --push
   ./scripts/opencode-os.sh save-audit --clipboard --commit --push

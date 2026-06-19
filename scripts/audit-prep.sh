@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 
 PULL=1
-COPY_TO_WINDOWS_DOWNLOADS=1
+COPY_TO_WINDOWS_DOWNLOADS=0
+COPY_TO_CLIPBOARD=0
 PRINT_PROMPT=0
 
 for arg in "$@"; do
@@ -10,8 +11,14 @@ for arg in "$@"; do
     --no-pull)
       PULL=0
       ;;
+    --windows-copy)
+      COPY_TO_WINDOWS_DOWNLOADS=1
+      ;;
     --no-windows-copy)
       COPY_TO_WINDOWS_DOWNLOADS=0
+      ;;
+    --clipboard)
+      COPY_TO_CLIPBOARD=1
       ;;
     --print-prompt)
       PRINT_PROMPT=1
@@ -23,15 +30,24 @@ Usage:
 
 Options:
   --no-pull            Do not run git pull before preparing audit files.
-  --no-windows-copy    Do not copy output files to Windows Downloads.
+  --windows-copy       Copy output files to Windows Downloads if available.
+  --no-windows-copy    Explicitly disable Windows Downloads copy.
+  --clipboard          Copy the audit prompt to the Windows clipboard if available.
   --print-prompt       Print the audit prompt to terminal.
   -h, --help           Show this help.
+
+Termius / iPhone default:
+  No Windows clipboard.
+  No Windows Downloads copy.
+  Use Termius SFTP to download:
+    dist/audit-requests/opencode-audit-upload.md
 
 Outputs:
   dist/context-packs/calvin-opencode-system-context-pack.md
   dist/audit-requests/audit-request.md
   dist/audit-requests/opencode-audit-upload.md
   dist/audit-requests/sensitive-warning-report.txt
+  dist/audit-requests/mobile-upload-instructions.txt
 HELP_EOF
       exit 0
       ;;
@@ -205,9 +221,18 @@ Sensitive warning report:
 
 Sensitive warning count:
   $warning_count
+
+Optional desktop-only helpers:
+
+Copy files to Windows Downloads:
+  ./scripts/opencode-os.sh audit-prep --windows-copy
+
+Copy prompt to Windows clipboard:
+  ./scripts/opencode-os.sh audit-prep --clipboard
 INSTRUCTIONS_EOF
 
 copied_to_windows="no"
+clipboard_status="not requested"
 
 if [[ "$COPY_TO_WINDOWS_DOWNLOADS" -eq 1 && -d /mnt/c/Users ]]; then
   while IFS= read -r downloads_dir; do
@@ -221,10 +246,17 @@ if [[ "$COPY_TO_WINDOWS_DOWNLOADS" -eq 1 && -d /mnt/c/Users ]]; then
   done < <(find /mnt/c/Users -maxdepth 2 -type d -name Downloads 2>/dev/null | sort)
 fi
 
-if command -v clip.exe >/dev/null 2>&1; then
-  clip.exe < "$PROMPT_FILE" || true
-elif [[ -x /mnt/c/Windows/System32/clip.exe ]]; then
-  /mnt/c/Windows/System32/clip.exe < "$PROMPT_FILE" || true
+if [[ "$COPY_TO_CLIPBOARD" -eq 1 ]]; then
+  clipboard_status="requested but unavailable"
+  if command -v clip.exe >/dev/null 2>&1; then
+    if clip.exe < "$PROMPT_FILE" 2>/dev/null; then
+      clipboard_status="copied with clip.exe"
+    fi
+  elif [[ -x /mnt/c/Windows/System32/clip.exe ]]; then
+    if /mnt/c/Windows/System32/clip.exe < "$PROMPT_FILE" 2>/dev/null; then
+      clipboard_status="copied with /mnt/c/Windows/System32/clip.exe"
+    fi
+  fi
 fi
 
 upload_size="$(du -h "$UPLOAD_FILE" | awk '{print $1}')"
@@ -259,6 +291,9 @@ echo "  $context_size"
 echo
 echo "Copied to Windows Downloads:"
 echo "  $copied_to_windows"
+echo
+echo "Clipboard:"
+echo "  $clipboard_status"
 echo
 
 if [[ "$PRINT_PROMPT" -eq 1 ]]; then
