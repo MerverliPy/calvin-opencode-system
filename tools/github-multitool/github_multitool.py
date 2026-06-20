@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -1467,6 +1468,371 @@ def cmd_pr_create(config: dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Feature 6: PR Body Generator
+# ---------------------------------------------------------------------------
+
+def _sanitize_filename(name: str) -> str:
+    """Sanitize branch name for use as a filename.
+
+    Replaces unsafe characters with hyphens, collapses multiple hyphens,
+    and strips leading/trailing hyphens and dots.
+    """
+    safe = re.sub(r'[^a-zA-Z0-9._-]', '-', name)
+    safe = re.sub(r'-{2,}', '-', safe)
+    safe = safe.strip('.-')
+    return safe if safe else "unnamed-branch"
+
+
+def _resolve_base_branch() -> str:
+    """Find the base branch to compare against.
+
+    Tries origin/main first, falls back to main.
+    Returns the branch name used.
+    """
+    for candidate in ("origin/main", "main"):
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", candidate],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return candidate
+    raise ToolError(
+        "Cannot find origin/main or main as base branch. "
+        "Create one or fetch from remote."
+    )
+
+
+def _collect_commit_subjects(base: str) -> list[str]:
+    """Collect commit subject lines from base..HEAD."""
+    result = subprocess.run(
+        ["git", "log", "--oneline", f"{base}..HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    return [line for line in result.stdout.strip().split("\n") if line]
+
+
+def _collect_changed_files(base: str) -> list[str]:
+    """Collect changed file paths with status markers from base..HEAD."""
+    result = subprocess.run(
+        ["git", "diff", "--name-status", f"{base}..HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    return [line for line in result.stdout.strip().split("\n") if line]
+
+
+def _collect_diff_stat(base: str) -> str:
+    """Collect compact diff stat from base..HEAD."""
+    result = subprocess.run(
+        ["git", "diff", "--stat", f"{base}..HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _extract_path_from_status(status_line: str) -> str:
+    """Extract the file path from a git diff --name-status line.
+
+    Lines have the format: M\tpath/to/file or A\tpath/to/file
+    For renames, the format is: R100\told\tnew
+    Returns the last tab-separated component (the destination path).
+    """
+    parts = status_line.split("\t")
+    return parts[-1] if parts else status_line
+
+
+def _detect_verification() -> tuple[bool, str]:
+    """Detect whether smoke test / verifier were recently run.
+
+    Returns (verification_detected, message).
+    Does not invent successful verification — only reports what can be proven.
+    """
+    smoke_files = [
+        "/tmp/github-multitool-cli-health.json",
+        "/tmp/github-multitool-cli-pr-readiness.json",
+    ]
+    found = 0
+    for fp in smoke_files:
+        p = Path(fp)
+        if p.exists():
+            try:
+                mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+                age = datetime.now(timezone.utc) - mtime
+                if age < timedelta(hours=24):
+                    found += 1
+            except OSError:
+                pass
+
+    if found > 0:
+        return (
+            True,
+            f"Smoke test evidence detected ({found} output file(s) modified within 24 hours).",
+        )
+    return (
+        False,
+        "Not automatically verified by this generator. Run the commands below before opening the PR.",
+    )
+
+
+def _generate_summary(
+    commit_subjects: list[str],
+    changed_files: list[str],
+    branch: str,
+) -> str:
+    """Generate a brief summary of the branch purpose."""
+    num_commits = len(commit_subjects)
+    num_files = len(changed_files)
+
+    if num_commits == 0:
+        return (
+            f"Branch `{branch}` has no commits ahead of base. "
+            f"{num_files} file(s) differ from base."
+        )
+
+    # Use first commit subject (without short hash) as a lead
+    first = commit_subjects[0]
+    first_subject = first.split(" ", 1)[1] if " " in first else first
+
+    # Identify affected directories
+    affected_dirs: set[str] = set()
+    for cf in changed_files:
+        path = _extract_path_from_status(cf)
+        top = path.split("/")[0] if "/" in path else "(root)"
+        affected_dirs.add(top)
+
+    dirs_str = ", ".join(sorted(affected_dirs)[:5])
+    if len(affected_dirs) > 5:
+        dirs_str += f", ... (+{len(affected_dirs) - 5} more)"
+
+    lines = [
+        f"Branch `{branch}` contains {num_commits} commit(s) affecting "
+        f"{num_files} file(s) across {dirs_str}.",
+        "",
+    ]
+    if num_commits == 1:
+        lines.append(f"**Change**: {first_subject}")
+    else:
+        lines.append(f"**First commit**: {first_subject}")
+        lines.append(f"_({num_commits - 1} additional commit(s) — see Changes section below)_")
+
+    return "\n".join(lines)
+
+
+def _build_pr_body_md(
+    branch: str,
+    base: str,
+    commit_subjects: list[str],
+    changed_files: list[str],
+    diff_stat: str,
+    verification_detected: bool,
+    verification_message: str,
+) -> str:
+    """Build the PR body Markdown content."""
+    lines: list[str] = []
+
+    # ── Header ──
+    lines.append(f"# PR Body: {branch}")
+    lines.append("")
+
+    # ── Summary ──
+    lines.append("## Summary")
+    lines.append("")
+    lines.append(_generate_summary(commit_subjects, changed_files, branch))
+    lines.append("")
+
+    # ── Changes ──
+    lines.append("## Changes")
+    lines.append("")
+
+    if commit_subjects:
+        lines.append("### Commits")
+        lines.append("")
+        for cs in commit_subjects:
+            lines.append(f"- {cs}")
+        lines.append("")
+
+    if changed_files:
+        lines.append("### Changed Files")
+        lines.append("")
+        for cf in changed_files:
+            lines.append(f"- `{cf}`")
+        lines.append("")
+
+    if diff_stat:
+        lines.append("### Diff Stat")
+        lines.append("")
+        lines.append("```")
+        lines.append(diff_stat)
+        lines.append("```")
+        lines.append("")
+
+    # ── Verification ──
+    lines.append("## Verification")
+    lines.append("")
+    lines.append("Run the following commands before opening the PR:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append("tools/github-multitool/smoke-test.sh")
+    lines.append("./scripts/verify-opencode-os.sh")
+    lines.append("git status --short --branch")
+    lines.append("```")
+    lines.append("")
+    lines.append(verification_message)
+    lines.append("")
+
+    # ── Risk ──
+    lines.append("## Risk")
+    lines.append("")
+
+    # Identify high-risk files from changed files
+    high_risk: list[str] = []
+    for cf in changed_files:
+        path = _extract_path_from_status(cf)
+        if _is_high_risk_file(path):
+            high_risk.append(path)
+
+    if high_risk:
+        lines.append(f"**⚠️ {len(high_risk)} high-risk file(s) detected.**")
+        lines.append("")
+        lines.append("The following files match high-risk patterns:")
+        lines.append("")
+        for f in high_risk:
+            lines.append(f"- `{f}`")
+        lines.append("")
+        lines.append("Pay extra attention to:")
+        lines.append("- Configuration and workflow impacts")
+        lines.append("- Security-sensitive paths")
+        lines.append("- Infrastructure changes")
+    else:
+        lines.append("No high-risk files detected in this change set.")
+        lines.append("")
+        lines.append("Standard review practices apply.")
+
+    lines.append("")
+
+    # ── Rollback ──
+    lines.append("## Rollback")
+    lines.append("")
+    base_clean = base.replace("origin/", "")
+    lines.append("To abandon this branch before merge:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append(f"git checkout {base_clean}")
+    lines.append(f"git branch -D {branch}")
+    lines.append("```")
+    lines.append("")
+    lines.append("If already merged and needs reversion:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append("git revert <merge-commit-hash>")
+    lines.append("```")
+    lines.append("")
+
+    # ── Reviewer Notes ──
+    lines.append("## Reviewer Notes")
+    lines.append("")
+    lines.append(f"- **Branch**: `{branch}` → `{base}`")
+    lines.append(f"- **Commits**: {len(commit_subjects)}")
+    lines.append(f"- **Files changed**: {len(changed_files)}")
+    lines.append("")
+    if high_risk:
+        lines.append("### Files Requiring Extra Scrutiny")
+        lines.append("")
+        for f in high_risk:
+            lines.append(f"- `{f}`")
+        lines.append("")
+    lines.append("Review checklist:")
+    lines.append("")
+    lines.append("1. **Correctness** — Does the logic accomplish the intended goal?")
+    lines.append("2. **Safety** — Are there security risks, token leaks, or unsafe patterns?")
+    lines.append("3. **Regression** — Could this break existing features or smoke tests?")
+    lines.append("4. **Completeness** — Are tests, documentation, and verification adequate?")
+    lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+def cmd_pr_body(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Generate a local PR body Markdown file from commits, changed files,
+    and available verification context.
+
+    Output is written to dist/github-pr-bodies/.
+    """
+    root = repo_root()
+
+    # Determine current branch
+    current_branch = _git_current_branch()
+
+    # Refuse if on main or master
+    if current_branch in ("main", "master"):
+        print_json({
+            "ok": False,
+            "error": (
+                f"Refusing to generate PR body on '{current_branch}' branch. "
+                "Switch to a feature branch first."
+            ),
+        })
+        return 1
+
+    # Determine base branch (origin/main fallback main)
+    base = _resolve_base_branch()
+
+    # Collect data from git
+    commit_subjects = _collect_commit_subjects(base)
+    changed_files = _collect_changed_files(base)
+    diff_stat = _collect_diff_stat(base)
+
+    # Detect verification status
+    verification_detected, verification_message = _detect_verification()
+
+    # Build markdown content
+    md_content = _build_pr_body_md(
+        branch=current_branch,
+        base=base,
+        commit_subjects=commit_subjects,
+        changed_files=changed_files,
+        diff_stat=diff_stat,
+        verification_detected=verification_detected,
+        verification_message=verification_message,
+    )
+
+    # Create output directory
+    output_dir = root / "dist" / "github-pr-bodies"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate safe filename from branch name
+    safe_branch = _sanitize_filename(current_branch)
+    output_path = output_dir / f"pr-body-{safe_branch}.md"
+
+    # Write file
+    output_path.write_text(md_content, encoding="utf-8")
+
+    # Print JSON result
+    result = {
+        "ok": True,
+        "output_path": str(output_path),
+        "branch": current_branch,
+        "base": base,
+        "commit_count": len(commit_subjects),
+        "changed_file_count": len(changed_files),
+        "verification_detected": verification_detected,
+    }
+    print_json(result)
+    return 0
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1547,6 +1913,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required confirmation flag. The command refuses without this flag.",
     )
     p.set_defaults(func=cmd_pr_create)
+
+    p = sub.add_parser("pr-body", help="Generate a local PR body Markdown file from commits and changed files.")
+    p.set_defaults(func=cmd_pr_body)
+
 
 
     return parser

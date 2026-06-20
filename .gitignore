@@ -48,3 +48,4 @@ tools/github-multitool/*.log
 
 # GitHub localhost multitool review packs
 dist/github-review-packs/
+dist/github-pr-bodies/

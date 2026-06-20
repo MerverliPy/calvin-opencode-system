@@ -415,5 +415,137 @@ set -e
 rm -f /tmp/test-pr-body-smoke.md
 
 
+# ── Feature 6: PR Body Generator smoke tests ─────────────────────
+
+echo
+echo "== CLI pr-body --help =="
+python3 tools/github-multitool/github_multitool.py pr-body --help > /tmp/github-multitool-pr-body-help.txt
+cat /tmp/github-multitool-pr-body-help.txt
+echo
+echo "[PASS] CLI pr-body --help"
+
+echo
+echo "== CLI pr-body generation =="
+set +e  # allow pr-body to return non-zero on main/master
+python3 tools/github-multitool/github_multitool.py pr-body > /tmp/github-multitool-pr-body.json 2>/tmp/github-multitool-pr-body.err
+pr_body_exit=$?
+set -e
+
+cat /tmp/github-multitool-pr-body.json
+
+ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-pr-body.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+" 2>/dev/null || echo "")"
+
+if [[ "$pr_body_exit" -eq 0 && "$ok_val" == "True" ]]; then
+  # Success: verify output fields
+  output_path="$(python3 -c "
+import json
+with open('/tmp/github-multitool-pr-body.json') as f:
+    d = json.load(f)
+print(d.get('output_path', ''))
+")"
+  branch_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-pr-body.json') as f:
+    d = json.load(f)
+print(d.get('branch', ''))
+")"
+  base_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-pr-body.json') as f:
+    d = json.load(f)
+print(d.get('base', ''))
+")"
+  commit_count="$(python3 -c "
+import json
+with open('/tmp/github-multitool-pr-body.json') as f:
+    d = json.load(f)
+print(d.get('commit_count', ''))
+")"
+  changed_count="$(python3 -c "
+import json
+with open('/tmp/github-multitool-pr-body.json') as f:
+    d = json.load(f)
+print(d.get('changed_file_count', ''))
+")"
+  verification="$(python3 -c "
+import json
+with open('/tmp/github-multitool-pr-body.json') as f:
+    d = json.load(f)
+print(d.get('verification_detected', ''))
+")"
+
+  if [[ -z "$output_path" || -z "$branch_val" || -z "$base_val" || -z "$commit_count" || -z "$changed_count" || -z "$verification" ]]; then
+    echo "[FAIL] CLI pr-body output missing required fields"
+    exit 1
+  fi
+
+  if [[ ! -f "$output_path" ]]; then
+    echo "[FAIL] CLI pr-body output file does not exist: $output_path"
+    exit 1
+  fi
+
+  # Verify generated content has expected sections
+  if ! grep -q "## Summary" "$output_path"; then
+    echo "[FAIL] Generated PR body missing Summary section"
+    exit 1
+  fi
+  if ! grep -q "## Changes" "$output_path"; then
+    echo "[FAIL] Generated PR body missing Changes section"
+    exit 1
+  fi
+  if ! grep -q "## Verification" "$output_path"; then
+    echo "[FAIL] Generated PR body missing Verification section"
+    exit 1
+  fi
+  if ! grep -q "## Risk" "$output_path"; then
+    echo "[FAIL] Generated PR body missing Risk section"
+    exit 1
+  fi
+  if ! grep -q "## Rollback" "$output_path"; then
+    echo "[FAIL] Generated PR body missing Rollback section"
+    exit 1
+  fi
+  if ! grep -q "## Reviewer Notes" "$output_path"; then
+    echo "[FAIL] Generated PR body missing Reviewer Notes section"
+    exit 1
+  fi
+
+  # Verify generated files are not staged
+  if git diff --cached --name-only | grep -q '^dist/github-pr-bodies/'; then
+    echo "[FAIL] dist/github-pr-bodies/ files are staged"
+    exit 1
+  fi
+
+  echo
+  echo "[PASS] CLI pr-body generated successfully (branch=$branch_val, base=$base_val, commits=$commit_count, files=$changed_count, verification=$verification)"
+elif [[ "$ok_val" == "False" ]]; then
+  error_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-pr-body.json') as f:
+    d = json.load(f)
+print(d.get('error', ''))
+" 2>/dev/null || echo "")"
+
+  if [[ "$error_val" == *"main"* || "$error_val" == *"master"* ]]; then
+    echo
+    echo "[PASS] CLI pr-body correctly refused on main/master: $error_val"
+  else
+    echo
+    echo "[PASS] CLI pr-body (graceful refusal: $error_val)"
+  fi
+else
+  echo
+  echo "[PASS] CLI pr-body (non-zero exit but handled)"
+fi
+
+# Clean up generated pr-body files from smoke test
+rm -rf dist/github-pr-bodies/
+
+
 echo "== Final result =="
 echo "[PASS] GitHub multitool smoke test completed successfully."

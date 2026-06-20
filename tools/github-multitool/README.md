@@ -496,6 +496,101 @@ All POST, PUT, and DELETE requests are rejected with HTTP 405.
 - Body file is read from disk by `gh`, not by this tool.
 
 
+## PR Body Generator (Feature 6)
+
+Generate a local PR body Markdown file from commits, changed files, and available
+verification context. The generated file can be reviewed and then used with
+`pr-create --body-file`.
+
+### Usage
+
+```bash
+python3 tools/github-multitool/github_multitool.py pr-body
+```
+
+### Example Output
+
+```json
+{
+  "ok": true,
+  "output_path": "/home/calvin/calvin-opencode-system/dist/github-pr-bodies/pr-body-feature-github-multitool-pr-body.md",
+  "branch": "feature-github-multitool-pr-body",
+  "base": "origin/main",
+  "commit_count": 4,
+  "changed_file_count": 5,
+  "verification_detected": true
+}
+```
+
+### Generated Output Location
+
+Output files are written to `dist/github-pr-bodies/` with the naming convention:
+
+```
+dist/github-pr-bodies/pr-body-<branch-name>.md
+```
+
+Branch names with unsafe filename characters (anything other than alphanumeric,
+hyphens, underscores, and dots) are sanitized by replacing unsafe characters
+with hyphens.
+
+Example:
+- Branch: `feature-github-multitool-pr-body`
+- Output: `dist/github-pr-bodies/pr-body-feature-github-multitool-pr-body.md`
+
+### Generated File Sections
+
+Each generated PR body Markdown file contains:
+
+| Section          | Contents                                                        |
+|------------------|-----------------------------------------------------------------|
+| Summary          | Branch purpose derived from commit subjects and changed files   |
+| Changes          | Commit list, changed file list, and compact diff stat           |
+| Verification     | Commands to run before opening the PR, plus auto-detection note |
+| Risk             | High-risk file analysis based on changed paths                  |
+| Rollback         | Commands to abandon or revert the branch safely                 |
+| Reviewer Notes   | Branch stats and a reusable review checklist                    |
+
+### Safety
+
+- Read-only: uses local `git` commands only (`git log`, `git diff`, `git branch`).
+- Does not talk to GitHub API — uses only the local repository state.
+- Refuses to generate on `main` or `master` branches.
+- Generated files are in `dist/github-pr-bodies/` which is gitignored.
+- Does not print tokens, credentials, or secret values.
+- Uses subprocess argument lists (no `shell=True`).
+
+### Using with pr-create
+
+1. Generate the PR body:
+   ```bash
+   python3 tools/github-multitool/github_multitool.py pr-body
+   ```
+2. Review the generated file at the output path.
+3. When satisfied, use it with `pr-create`:
+   ```bash
+   python3 tools/github-multitool/github_multitool.py pr-create      --title "Your PR title"      --body-file dist/github-pr-bodies/pr-body-<branch>.md      --head current      --confirm
+   ```
+
+### Verification Detection
+
+The generator checks for recent smoke test output files (within 24 hours) to
+detect whether local verification was run. If no evidence is found, the
+Verification section includes a note:
+
+> Not automatically verified by this generator. Run the commands below before
+> opening the PR.
+
+This ensures the generator is honest and never invents successful verification.
+
+### Base Branch Resolution
+
+- Compares against `origin/main` by default.
+- Falls back to `main` if `origin/main` is unavailable (e.g., no remote
+  configured or never fetched).
+- Raises an error if neither base branch is available.
+
+
 ## Smoke Test
 
 Run the local smoke test:
@@ -520,3 +615,4 @@ The smoke test checks:
 - server branches list endpoint
 - server strict-private route behavior
 - rejection of write HTTP methods
+ - CLI pr-body generation (with safe fallback on main branch)
