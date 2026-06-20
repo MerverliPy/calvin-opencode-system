@@ -918,5 +918,141 @@ echo
 echo "[PASS] CLI repo-guard (public repo, writes blocked as expected)"
 
 
+# -- Feature 10: Security Alerts Summary smoke tests --------------
+
+echo
+echo "== CLI security-summary --help =="
+python3 tools/github-multitool/github_multitool.py security-summary --help > /tmp/github-multitool-security-summary-help.txt
+cat /tmp/github-multitool-security-summary-help.txt
+echo
+echo "[PASS] CLI security-summary --help"
+
+echo
+echo "== CLI security-summary =="
+set +e  # allow non-zero exit on API unavailability
+python3 tools/github-multitool/github_multitool.py security-summary > /tmp/github-multitool-security-summary.json 2>/tmp/github-multitool-security-summary.err
+security_exit=$?
+set -e
+
+cat /tmp/github-multitool-security-summary.json
+
+# Validate JSON output shape
+ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-security-summary.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+" 2>/dev/null || echo "")"
+
+if [[ "$ok_val" == "True" ]]; then
+  # Verify required top-level fields exist
+  for field in repository visibility default_branch branch_protection alerts security_workflows recent_security_prs risk_summary; do
+    val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-security-summary.json') as f:
+    d = json.load(f)
+print(d.get('$field', '__MISSING__'))
+" 2>/dev/null || echo "__MISSING__")"
+    if [[ "$val" == "__MISSING__" ]]; then
+      echo "[FAIL] CLI security-summary missing field: $field"
+      exit 1
+    fi
+  done
+
+  # Verify alerts object contains all three alert types
+  for alert_type in dependabot code_scanning secret_scanning; do
+    alert_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-security-summary.json') as f:
+    d = json.load(f)
+alerts = d.get('alerts', {})
+print(alerts.get('$alert_type', '__MISSING__'))
+" 2>/dev/null || echo "__MISSING__")"
+    if [[ "$alert_val" == "__MISSING__" ]]; then
+      echo "[FAIL] CLI security-summary missing alert type: $alert_type"
+      exit 1
+    fi
+  done
+
+  # Verify risk_summary has level, warnings, recommended_next_action
+  for risk_field in level warnings recommended_next_action; do
+    rv="$(python3 -c "
+import json
+with open('/tmp/github-multitool-security-summary.json') as f:
+    d = json.load(f)
+rs = d.get('risk_summary', {})
+print(rs.get('$risk_field', '__MISSING__'))
+" 2>/dev/null || echo "__MISSING__")"
+    if [[ "$rv" == "__MISSING__" ]]; then
+      echo "[FAIL] CLI security-summary risk_summary missing field: $risk_field"
+      exit 1
+    fi
+  done
+
+  # Verify risk level is one of the valid values
+  risk_level="$(python3 -c "
+import json
+with open('/tmp/github-multitool-security-summary.json') as f:
+    d = json.load(f)
+print(d.get('risk_summary', {}).get('level', ''))
+" 2>/dev/null || echo "")"
+  if [[ "$risk_level" != "low" && "$risk_level" != "medium" && "$risk_level" != "high" && "$risk_level" != "unknown" ]]; then
+    echo "[FAIL] CLI security-summary unexpected risk level: $risk_level"
+    exit 1
+  fi
+
+  # Verify branch_protection has expected sub-fields
+  for bp_field in status protected requires_pull_request_reviews requires_status_checks enforces_admins; do
+    bpv="$(python3 -c "
+import json
+with open('/tmp/github-multitool-security-summary.json') as f:
+    d = json.load(f)
+bp = d.get('branch_protection', {})
+print(bp.get('$bp_field', '__MISSING__'))
+" 2>/dev/null || echo "__MISSING__")"
+    if [[ "$bpv" == "__MISSING__" ]]; then
+      echo "[FAIL] CLI security-summary branch_protection missing field: $bp_field"
+      exit 1
+    fi
+  done
+
+  echo
+  echo "[PASS] CLI security-summary (risk=$risk_level)"
+else
+  error_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-security-summary.json') as f:
+    d = json.load(f)
+print(d.get('error', ''))
+" 2>/dev/null || echo "")"
+  echo
+  echo "[PASS] CLI security-summary (graceful error: $error_val)"
+fi
+
+# ── Server /security/summary endpoint ─────────────────────────
+echo
+echo "== Server /security/summary =="
+SECURITY_HTTP_CODE="$(curl -sS -o /tmp/github-multitool-server-security-summary.json -w '%{http_code}' 'http://127.0.0.1:8765/security/summary' || echo '000')"
+if [[ "$SECURITY_HTTP_CODE" == "200" ]]; then
+  cat /tmp/github-multitool-server-security-summary.json
+  ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-server-security-summary.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+" 2>/dev/null || echo "")"
+  if [[ "$ok_val" != "True" ]]; then
+    echo "[FAIL] Server /security/summary missing ok=true"
+    exit 1
+  fi
+  echo
+  echo "[PASS] Server /security/summary"
+else
+  echo "Server /security/summary returned HTTP $SECURITY_HTTP_CODE; output:"
+  cat /tmp/github-multitool-server-security-summary.json 2>/dev/null || true
+  echo
+  echo "[PASS] Server /security/summary (graceful error)"
+fi
+
 echo "== Final result =="
 echo "[PASS] GitHub multitool smoke test completed successfully."

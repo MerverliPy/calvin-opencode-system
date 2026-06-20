@@ -2470,6 +2470,432 @@ def cmd_issue_plan(config: dict[str, Any], args: argparse.Namespace) -> int:
     print_json(output)
     return 0
 
+# ---------------------------------------------------------------------------
+# Feature 10: Security Alerts Summary helpers and command
+# ---------------------------------------------------------------------------
+
+SECURITY_WORKFLOW_KEYWORDS = [
+    "security", "codeql", "dependabot", "secret", "scan", "audit", "vulnerability",
+]
+
+SECURITY_PR_KEYWORDS = [
+    "security", "codeql", "dependabot", "secret", "scan", "audit", "vulnerability",
+]
+
+
+def _try_gh_api(repo: str, endpoint_path: str) -> dict[str, Any]:
+    """Call ``gh api`` safely and return structured result.
+
+    Returns a dict with:
+      - status: "available" or "unavailable"
+      - data: parsed JSON payload (only when status=="available")
+      - reason: explanation (only when status=="unavailable")
+    """
+    require_gh()
+    result = subprocess.run(
+        ["gh", "api", endpoint_path],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "403" in stderr:
+            reason = "GitHub API returned 403 or feature unavailable."
+        elif "404" in stderr:
+            reason = "GitHub API returned 404 or feature not available on this plan."
+        elif "401" in stderr:
+            reason = "GitHub API returned 401 (authentication required)."
+        else:
+            excerpt = stderr[:300].replace("\n", " ")
+            reason = f"GitHub API error: {excerpt}"
+        return {"status": "unavailable", "reason": reason}
+
+    stdout = result.stdout.strip()
+    if not stdout:
+        return {"status": "available", "data": []}
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        return {"status": "unavailable", "reason": f"Non-JSON response from GitHub API: {exc}"}
+
+    return {"status": "available", "data": data}
+
+
+def _check_branch_protection(repo: str, branch: str) -> dict[str, Any]:
+    """Check branch protection status for *branch* via gh api.
+
+    Returns the branch_protection dict for the security summary.
+    404 is treated as: protected=false, availability=not_protected_or_unavailable.
+    """
+    result = _try_gh_api(repo, f"repos/{repo}/branches/{branch}/protection")
+
+    if result.get("status") == "available":
+        data = result.get("data", {})
+        if isinstance(data, dict):
+            # Determine if protected (any rules present)
+            protected = bool(data)
+            requires_reviews = False
+            requires_status_checks = False
+            enforces_admins = False
+
+            if protected:
+                rp = data.get("required_pull_request_reviews") or {}
+                requires_reviews = bool(rp) if isinstance(rp, dict) else bool(rp)
+
+                sc = data.get("required_status_checks") or {}
+                requires_status_checks = bool(sc) if isinstance(sc, dict) else bool(sc)
+
+                ea = data.get("enforce_admins") or {}
+                if isinstance(ea, dict):
+                    enforces_admins = ea.get("enabled", False)
+                elif isinstance(ea, bool):
+                    enforces_admins = ea
+
+            return {
+                "status": "available",
+                "protected": protected,
+                "requires_pull_request_reviews": requires_reviews,
+                "requires_status_checks": requires_status_checks,
+                "enforces_admins": enforces_admins,
+            }
+        else:
+            return {
+                "status": "available",
+                "protected": False,
+                "requires_pull_request_reviews": False,
+                "requires_status_checks": False,
+                "enforces_admins": False,
+            }
+
+    # Unavailable: distinguish 404 from other errors
+    reason = result.get("reason", "")
+    if "404" in reason:
+        return {
+            "status": "not_protected_or_unavailable",
+            "protected": False,
+            "requires_pull_request_reviews": False,
+            "requires_status_checks": False,
+            "enforces_admins": False,
+        }
+    return {
+        "status": "unavailable",
+        "protected": False,
+        "requires_pull_request_reviews": False,
+        "requires_status_checks": False,
+        "enforces_admins": False,
+    }
+
+
+def _check_alert_endpoint(repo: str, alert_type: str) -> dict[str, Any]:
+    """Check a GitHub security alert endpoint and return count/status.
+
+    *alert_type* is one of: dependabot, code-scanning, secret-scanning.
+    """
+    endpoint_map = {
+        "dependabot": f"repos/{repo}/dependabot/alerts?state=open&per_page=1",
+        "code-scanning": f"repos/{repo}/code-scanning/alerts?state=open&per_page=1",
+        "secret-scanning": f"repos/{repo}/secret-scanning/alerts?state=open&per_page=1",
+    }
+    endpoint = endpoint_map.get(alert_type)
+    if not endpoint:
+        return {"status": "unavailable", "open_count": None, "reason": f"Unknown alert type: {alert_type}"}
+
+    result = _try_gh_api(repo, endpoint)
+
+    if result.get("status") == "available":
+        data = result.get("data", [])
+        if isinstance(data, list):
+            return {"status": "available", "open_count": len(data)}
+        elif isinstance(data, dict) and "message" in data:
+            return {"status": "unavailable", "open_count": None, "reason": data.get("message", "Unknown API message")}
+        else:
+            return {"status": "available", "open_count": 0}
+    else:
+        return {
+            "status": "unavailable",
+            "open_count": None,
+            "reason": result.get("reason", "GitHub API unavailable."),
+        }
+
+
+def _detect_security_workflows(root: Path) -> dict[str, Any]:
+    """Detect security-related workflows from local .github/workflows/ files.
+
+    Treats filenames or workflow content containing security-related keywords
+    as security workflows.
+    """
+    workflows_dir = root / ".github" / "workflows"
+    if not workflows_dir.is_dir():
+        return {"present": False, "files": []}
+
+    security_files: list[str] = []
+    for wf_file in sorted(workflows_dir.glob("*.yml")):
+        name_lower = wf_file.name.lower()
+        try:
+            content = wf_file.read_text(encoding="utf-8").lower()
+        except Exception:
+            content = ""
+
+        combined = f"{name_lower} {content}"
+        if any(kw in combined for kw in SECURITY_WORKFLOW_KEYWORDS):
+            security_files.append(str(wf_file.relative_to(root)))
+
+    # Also check .yaml extension
+    for wf_file in sorted(workflows_dir.glob("*.yaml")):
+        name_lower = wf_file.name.lower()
+        try:
+            content = wf_file.read_text(encoding="utf-8").lower()
+        except Exception:
+            content = ""
+
+        combined = f"{name_lower} {content}"
+        if any(kw in combined for kw in SECURITY_WORKFLOW_KEYWORDS):
+            rel = str(wf_file.relative_to(root))
+            if rel not in security_files:
+                security_files.append(rel)
+
+    return {
+        "present": len(security_files) > 0,
+        "files": sorted(security_files),
+    }
+
+
+def _detect_security_prs(repo: str) -> list[dict[str, Any]]:
+    """Detect recent security-related open PRs via ``gh pr list``.
+
+    Filters PR titles, labels, and branch names for security-related terms.
+    """
+    try:
+        prs = run_gh_json([
+            "pr", "list",
+            "--repo", repo,
+            "--state", "open",
+            "--limit", "50",
+            "--json", "number,title,headRefName,url,updatedAt,labels",
+        ])
+    except ToolError:
+        return []
+
+    if not isinstance(prs, list):
+        return []
+
+    security_prs: list[dict[str, Any]] = []
+    for pr in prs:
+        title = (pr.get("title") or "").lower()
+        head_ref = (pr.get("headRefName") or "").lower()
+
+        labels_list = pr.get("labels") or []
+        label_names: list[str] = []
+        for lbl in labels_list:
+            if isinstance(lbl, dict):
+                name = (lbl.get("name") or "").lower()
+            else:
+                name = str(lbl).lower()
+            label_names.append(name)
+
+        combined = f"{title} {head_ref} {' '.join(label_names)}"
+        if any(kw in combined for kw in SECURITY_PR_KEYWORDS):
+            security_prs.append({
+                "number": pr.get("number"),
+                "title": pr.get("title"),
+                "url": pr.get("url"),
+                "updated_at": pr.get("updatedAt"),
+            })
+
+    # Sort by most recently updated first
+    security_prs.sort(key=lambda p: p.get("updated_at") or "", reverse=True)
+    return security_prs
+
+
+def _compute_risk_summary(
+    is_private: bool,
+    branch_protection: dict[str, Any],
+    dependabot: dict[str, Any],
+    code_scanning: dict[str, Any],
+    secret_scanning: dict[str, Any],
+    security_workflows: dict[str, Any],
+) -> dict[str, Any]:
+    """Compute overall security risk level and produce warnings/recommendations."""
+    warnings: list[str] = []
+    is_public = not is_private
+
+    # ── Collect observations ───────────────────────────────────────
+    if is_public:
+        warnings.append("Repository is public.")
+
+    bp_protected = bool(branch_protection.get("protected", False))
+    bp_status = branch_protection.get("status", "unavailable")
+
+    if not bp_protected:
+        if bp_status == "available":
+            warnings.append("Default branch protection is not enabled.")
+        else:
+            warnings.append("Default branch protection is not enabled or unavailable.")
+
+    secret_open = secret_scanning.get("open_count") or 0
+    code_open = code_scanning.get("open_count") or 0
+    dep_open = dependabot.get("open_count") or 0
+
+    if secret_scanning.get("status") == "available" and secret_open > 0:
+        warnings.append(f"{secret_open} open secret scanning alert(s) detected.")
+    if code_scanning.get("status") == "available" and code_open > 0:
+        warnings.append(f"{code_open} open code scanning alert(s) detected.")
+    if dependabot.get("status") == "available" and dep_open > 0:
+        warnings.append(f"{dep_open} open Dependabot alert(s) detected.")
+
+    if dependabot.get("status") == "unavailable":
+        warnings.append("Dependabot alerts are unavailable.")
+    if code_scanning.get("status") == "unavailable":
+        warnings.append("Code scanning alerts are unavailable.")
+    if secret_scanning.get("status") == "unavailable":
+        warnings.append("Secret scanning alerts are unavailable.")
+
+    if not security_workflows.get("present", False):
+        warnings.append("No security workflows detected.")
+
+    # ── Determine risk level ──────────────────────────────────────
+    alerts_available = any(
+        a.get("status") == "available"
+        for a in [dependabot, code_scanning, secret_scanning]
+    )
+    has_open_alerts = (
+        (dependabot.get("status") == "available" and dep_open > 0) or
+        (code_scanning.get("status") == "available" and code_open > 0) or
+        (secret_scanning.get("status") == "available" and secret_open > 0)
+    )
+
+    # HIGH
+    if is_public and secret_scanning.get("status") == "available" and secret_open > 0:
+        level = "high"
+    elif code_scanning.get("status") == "available" and code_open > 0:
+        level = "high"
+    # MEDIUM
+    elif is_public:
+        level = "medium"
+    elif bp_status != "available":
+        level = "medium"
+    elif not bp_protected:
+        level = "medium"
+    elif not alerts_available:
+        level = "medium"
+    elif not security_workflows.get("present", False):
+        level = "medium"
+    # LOW
+    elif not is_public and bp_protected and not has_open_alerts and security_workflows.get("present", False):
+        level = "low"
+    # UNKNOWN
+    elif not alerts_available and bp_status != "available":
+        level = "unknown"
+    else:
+        level = "medium"
+
+    # ── Recommendation ────────────────────────────────────────────
+    if level == "high":
+        recommended = "Address open security alerts and enable branch protection immediately."
+    elif level == "medium":
+        recommended = "Enable branch protection and review GitHub security alert availability."
+    elif level == "low":
+        recommended = "No urgent security actions required. Maintain current posture."
+    else:
+        recommended = "Most security posture checks unavailable. Verify GitHub permissions and plan features."
+
+    return {
+        "level": level,
+        "warnings": warnings,
+        "recommended_next_action": recommended,
+    }
+
+
+def collect_security_summary(config: dict[str, Any], repo: str) -> dict[str, Any]:
+    """Collect a comprehensive security posture summary for *repo*.
+
+    All checks are read-only.  Alert endpoints that return 403/404 are
+    reported as *unavailable* rather than crashing.
+    """
+    require_gh()
+    root = repo_root()
+
+    # ── Visibility ─────────────────────────────────────────────────
+    try:
+        vis_data = run_gh_json([
+            "repo", "view", repo,
+            "--json", "nameWithOwner,visibility,isPrivate",
+        ])
+    except ToolError as exc:
+        return {
+            "ok": False,
+            "error": f"Failed to fetch repository visibility: {exc}",
+        }
+
+    repository_name = vis_data.get("nameWithOwner", repo)
+    visibility = (vis_data.get("visibility") or "UNKNOWN").upper()
+    is_private = vis_data.get("isPrivate", None)
+
+    # ── Default branch ─────────────────────────────────────────────
+    # Reuse _get_default_branch helper (Feature 7)
+    try:
+        default_branch = _get_default_branch(repo)
+    except Exception:
+        default_branch = "main"
+
+    # ── Branch protection ──────────────────────────────────────────
+    branch_protection = _check_branch_protection(repo, default_branch)
+
+    # ── Dependabot alerts ──────────────────────────────────────────
+    dependabot = _check_alert_endpoint(repo, "dependabot")
+
+    # ── Code scanning alerts ───────────────────────────────────────
+    code_scanning = _check_alert_endpoint(repo, "code-scanning")
+
+    # ── Secret scanning alerts ─────────────────────────────────────
+    secret_scanning = _check_alert_endpoint(repo, "secret-scanning")
+
+    # ── Security workflows ─────────────────────────────────────────
+    security_workflows = _detect_security_workflows(root)
+
+    # ── Recent security PRs ────────────────────────────────────────
+    recent_security_prs = _detect_security_prs(repo)
+
+    # ── Risk summary ───────────────────────────────────────────────
+    risk_summary = _compute_risk_summary(
+        is_private=is_private is True,
+        branch_protection=branch_protection,
+        dependabot=dependabot,
+        code_scanning=code_scanning,
+        secret_scanning=secret_scanning,
+        security_workflows=security_workflows,
+    )
+
+    return {
+        "ok": True,
+        "repository": repository_name,
+        "visibility": visibility,
+        "default_branch": default_branch,
+        "branch_protection": branch_protection,
+        "alerts": {
+            "dependabot": dependabot,
+            "code_scanning": code_scanning,
+            "secret_scanning": secret_scanning,
+        },
+        "security_workflows": security_workflows,
+        "recent_security_prs": recent_security_prs,
+        "risk_summary": risk_summary,
+    }
+
+
+def cmd_security_summary(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Summarize GitHub security posture from read-only commands."""
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+    result = collect_security_summary(config, repo)
+    print_json(result)
+    return 0 if result.get("ok") else 2
+
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="github_multitool.py",
@@ -2563,6 +2989,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("number", type=int, help="Issue number to plan from.")
     p.set_defaults(func=cmd_issue_plan)
 
+    p = sub.add_parser("security-summary", help="Summarize GitHub security posture (read-only).")
+    p.set_defaults(func=cmd_security_summary)
 
 
     return parser

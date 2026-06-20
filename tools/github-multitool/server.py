@@ -14,6 +14,7 @@ Read-only MVP endpoints:
 - GET /pr/<number>
 - GET /pr/<number>/readiness
 - GET /run/<run_id>/explain
+- GET /security/summary
 
 Write endpoints (deferred/disabled):
 - POST /pr/create    — CLI command exists (pr-create) but server endpoint is
@@ -199,6 +200,11 @@ class Handler(BaseHTTPRequestHandler):
             run_id = parts[2]
             log_lines = first(query, "log_lines", "80")
             code, payload = run_cli([*base_args, "run-explain", run_id, "--log-lines", log_lines])
+            self.send_json(200 if code == 0 else 500, payload)
+            return
+
+        if path == "/security/summary":
+            code, payload = run_cli([*base_args, "security-summary"])
             self.send_json(200 if code == 0 else 500, payload)
             return
 

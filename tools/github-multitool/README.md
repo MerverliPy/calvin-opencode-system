@@ -913,6 +913,128 @@ operation, then disable it.
 - Returns stable JSON output.
 
 
+## Security Alerts Summary (Feature 10)
+
+Summarize the GitHub security posture for the repository from one read-only
+command and one read-only localhost endpoint.  The summary includes
+repository visibility, branch protection status, open Dependabot alerts,
+code scanning alerts, secret scanning alerts, security workflow presence,
+recent security-related PRs, and a risk summary with recommended actions.
+
+### Usage
+
+~~~~bash
+python3 tools/github-multitool/github_multitool.py security-summary
+~~~~
+
+### Server Endpoint
+
+~~~~bash
+curl -s http://127.0.0.1:8765/security/summary
+~~~~
+
+### Example Output
+
+~~~~json
+{
+  "ok": true,
+  "repository": "MerverliPy/calvin-opencode-system",
+  "visibility": "PUBLIC",
+  "default_branch": "main",
+  "branch_protection": {
+    "status": "available",
+    "protected": false,
+    "requires_pull_request_reviews": false,
+    "requires_status_checks": false,
+    "enforces_admins": false
+  },
+  "alerts": {
+    "dependabot": {
+      "status": "available",
+      "open_count": 0
+    },
+    "code_scanning": {
+      "status": "unavailable",
+      "open_count": null,
+      "reason": "GitHub API returned 403 or feature unavailable."
+    },
+    "secret_scanning": {
+      "status": "unavailable",
+      "open_count": null,
+      "reason": "GitHub API returned 403 or feature unavailable."
+    }
+  },
+  "security_workflows": {
+    "present": false,
+    "files": []
+  },
+  "recent_security_prs": [],
+  "risk_summary": {
+    "level": "medium",
+    "warnings": [
+      "Repository is public.",
+      "Default branch protection is not enabled or unavailable."
+    ],
+    "recommended_next_action": "Enable branch protection and review GitHub security alert availability."
+  }
+}
+~~~~
+
+### Security Checks
+
+| Check                     | Source                                          | Unavailable Handling           |
+|---------------------------|-------------------------------------------------|--------------------------------|
+| Repository visibility     | `gh repo view`                                  | Blocks summary if unreachable  |
+| Default branch            | `gh repo view` + local git fallback             | Falls back to `main`           |
+| Branch protection         | `gh api repos/.../branches/.../protection`      | `not_protected_or_unavailable` |
+| Dependabot alerts         | `gh api repos/.../dependabot/alerts?state=open` | `unavailable` with reason      |
+| Code scanning alerts      | `gh api repos/.../code-scanning/alerts?state=open` | `unavailable` with reason   |
+| Secret scanning alerts    | `gh api repos/.../secret-scanning/alerts?state=open` | `unavailable` with reason  |
+| Security workflows        | Local `.github/workflows/` file scan            | Returns `present: false`       |
+| Recent security PRs       | `gh pr list` filtered by title/label/branch     | Returns empty list             |
+
+### Risk Levels
+
+| Level    | Triggers                                                                               |
+|----------|----------------------------------------------------------------------------------------|
+| `high`   | Public repo + open secret scanning alerts, or open code scanning alerts                |
+| `medium` | Public repo, branch protection absent/unavailable, security alert APIs unavailable, or no security workflows |
+| `low`    | Private repo, branch protection enabled, no open alerts, security workflows present    |
+| `unknown`| Most security posture checks unavailable                                               |
+
+### Unavailable ≠ Zero Alerts
+
+When GitHub does not expose security alert data (due to permissions, plan
+features, or disabled features), the tool reports `"status": "unavailable"`
+rather than silently treating it as zero alerts.  This prevents a false sense
+of security.
+
+### GitHub Permissions
+
+- **Dependabot alerts**: Requires the repository to have Dependabot enabled
+  and the authenticated user to have read access.  Not available on all plans.
+- **Code scanning alerts**: Requires GitHub Advanced Security or code scanning
+  to be enabled.  Returns 403 if the feature is unavailable.
+- **Secret scanning alerts**: Requires GitHub Advanced Security or secret
+  scanning to be enabled.  Returns 403 if the feature is unavailable.
+- **Branch protection**: Requires admin permissions to view protection rules.
+  Returns 404 if no protection rules are configured.
+
+### Secret Scanning Safety
+
+- Only summary metadata (count, status, type) is reported if accessible.
+- **Never requests or prints secret values.**
+- GitHub's API does not expose actual secret content in alert listings.
+
+### Safety
+
+- Read-only: uses `gh repo view`, `gh api`, `gh pr list`, and local file reads.
+- Does not create, modify, or delete any GitHub resources.
+- Does not print tokens, credentials, or secret values.
+- Uses subprocess argument lists (no `shell=True`).
+- Handles 401, 403, 404, and missing permissions gracefully.
+- Returns stable JSON output.
+
 ## Smoke Test
 
 Run the local smoke test:
