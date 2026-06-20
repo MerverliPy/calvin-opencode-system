@@ -335,5 +335,85 @@ fi
 echo "[PASS] POST rejected"
 
 echo
+
+# ── Feature 5: Safe PR Creator smoke tests ─────────────────────
+
+echo
+echo "== CLI pr-create --help =="
+python3 tools/github-multitool/github_multitool.py pr-create --help > /tmp/github-multitool-pr-create-help.txt
+cat /tmp/github-multitool-pr-create-help.txt
+echo
+echo "[PASS] CLI pr-create --help"
+
+# Create a temp body file for refusal tests
+echo "test body" > /tmp/test-pr-body-smoke.md
+
+echo
+echo "== CLI pr-create refusal without --confirm =="
+set +e  # allow pr-create refusal to return non-zero
+python3 tools/github-multitool/github_multitool.py pr-create   --title "test"   --body-file /tmp/test-pr-body-smoke.md   --head current   > /tmp/github-multitool-pr-create-no-confirm.json 2>/tmp/github-multitool-pr-create-no-confirm.err
+
+cat /tmp/github-multitool-pr-create-no-confirm.json
+
+ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-pr-create-no-confirm.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+")"
+error_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-pr-create-no-confirm.json') as f:
+    d = json.load(f)
+print(d.get('error', ''))
+")"
+
+if [[ "$ok_val" != "False" ]]; then
+  echo "[FAIL] Expected ok=false for pr-create without --confirm, got ok=$ok_val"
+  exit 1
+fi
+if [[ "$error_val" != *"confirm"* ]]; then
+  echo "[FAIL] Expected confirm-related error, got: $error_val"
+  exit 1
+fi
+echo "[PASS] CLI pr-create refused without --confirm: $error_val"
+set -e
+
+echo
+echo "== CLI pr-create refusal with write tools disabled =="
+# Write tools are disabled by default in config, so this should refuse
+set +e  # allow pr-create refusal to return non-zero
+python3 tools/github-multitool/github_multitool.py pr-create   --title "test"   --body-file /tmp/test-pr-body-smoke.md   --head current   --confirm   > /tmp/github-multitool-pr-create-disabled.json 2>/tmp/github-multitool-pr-create-disabled.err
+
+cat /tmp/github-multitool-pr-create-disabled.json
+
+ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-pr-create-disabled.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+")"
+error_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-pr-create-disabled.json') as f:
+    d = json.load(f)
+print(d.get('error', ''))
+")"
+
+if [[ "$ok_val" != "False" ]]; then
+  echo "[FAIL] Expected ok=false for pr-create with write tools disabled, got ok=$ok_val"
+  exit 1
+fi
+if [[ "$error_val" != *"Write tools are disabled"* ]]; then
+  echo "[FAIL] Expected write-tools-disabled error, got: $error_val"
+  exit 1
+fi
+echo "[PASS] CLI pr-create refused with write tools disabled: $error_val"
+set -e
+
+# Clean up temp files
+rm -f /tmp/test-pr-body-smoke.md
+
+
 echo "== Final result =="
 echo "[PASS] GitHub multitool smoke test completed successfully."

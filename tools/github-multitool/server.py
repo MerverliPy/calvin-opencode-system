@@ -6,11 +6,19 @@ Read-only MVP endpoints:
 - GET /health
 - GET /repo/status
 - GET /prs
+- GET /prs/dashboard
 - GET /issues
 - GET /branches
 - GET /runs
+- GET /runs/failed
 - GET /pr/<number>
 - GET /pr/<number>/readiness
+- GET /run/<run_id>/explain
+
+Write endpoints (deferred/disabled):
+- POST /pr/create    — CLI command exists (pr-create) but server endpoint is
+                       intentionally disabled. Enable write tools in config and
+                       use the CLI directly.
 
 Security model:
 - Binds only to localhost / 127.0.0.1.
@@ -99,13 +107,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(status, {"ok": False, "error": message})
 
     def do_POST(self) -> None:
-        self.reject(405, "Write endpoints are disabled in the read-only MVP.")
+        self.reject(405, "Write endpoints are disabled in the read-only MVP. POST /pr/create is deferred.")
 
     def do_PUT(self) -> None:
-        self.reject(405, "Write endpoints are disabled in the read-only MVP.")
+        self.reject(405, "Write endpoints are disabled in the read-only MVP. POST /pr/create is deferred.")
 
     def do_DELETE(self) -> None:
-        self.reject(405, "Write endpoints are disabled in the read-only MVP.")
+        self.reject(405, "Write endpoints are disabled in the read-only MVP. POST /pr/create is deferred.")
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)

@@ -43,10 +43,10 @@ runs-list
 Write commands later:
 
 ~~~~text
-pr-create
-pr-comment
-pr-merge
-branch-delete
+pr-create        ← available (gated, disabled by default)
+pr-comment       ← planned
+pr-merge         ← planned
+branch-delete    ← planned
 ~~~~
 
 ## Safety Model
@@ -359,6 +359,141 @@ The tool automatically classifies failures using pattern matching on log output:
 - Does not print tokens, credentials, or secret values.
 - Log output is redacted before display.
 - Sensitive patterns (token, secret, credential, password, cookie, authorization, bearer, GH_TOKEN, GITHUB_TOKEN) are filtered from log excerpts.
+
+
+
+## Safe PR Creator (Feature 5)
+
+The first write-capable command. Heavily gated and **disabled by default**.
+
+### Usage
+
+```bash
+python3 tools/github-multitool/github_multitool.py pr-create \
+  --title "Add feature" \
+  --body-file /tmp/pr-body.md \
+  --base main \
+  --head current \
+  --confirm
+```
+
+### Safety Gates
+
+**The command refuses unless ALL of these conditions are met:**
+
+| # | Gate | Refusal Message |
+|---|------|-----------------|
+| 1 | `allow_write_tools` is `true` in config | `Write tools are disabled. Set allow_write_tools=true in config to enable gated write commands.` |
+| 2 | `--confirm` flag is present | `Refusing to create PR without --confirm.` |
+| 3 | Current branch is not `main` or `master` | `Refusing to create PR from main branch.` |
+| 4 | Working tree is clean (`git status --porcelain` empty) | `Refusing to create PR: working tree is not clean.` |
+| 5 | Branch has commits ahead of base | `Refusing to create PR: head branch has 0 commits ahead of base.` |
+| 6 | PR title is non-empty | `PR title must be non-empty.` |
+| 7 | Body file exists (`--body-file`) | `Refusing to create PR: body file does not exist.` |
+| 8 | Repository is in the allowlist | `Repository is not allowlisted.` |
+| 9 | Repository visibility guard passes | Covered by `warn_public_repositories` / `strict_private` |
+
+### Write Tools Are Disabled By Default
+
+The config key `allow_write_tools` defaults to `false`. To enable gated write
+commands, intentionally change it to `true`:
+
+```json
+{
+  "allow_write_tools": true
+}
+```
+
+**Recommendation:** Enable write tools only for the duration of the PR creation
+operation, then disable them again.
+
+### Safe PR Preview
+
+Before executing `gh pr create`, the tool prints a preview to stderr:
+
+```text
+--- PR Preview ---
+Repository:     MerverliPy/calvin-opencode-system
+Title:          Add feature
+Base:           main
+Head:           feature-branch
+Body file:      /tmp/pr-body.md
+Commits ahead:  3
+Current branch: feature-branch
+--- Creating PR ---
+```
+
+### Expected Output
+
+**Refusal (write tools disabled):**
+```json
+{
+  "ok": false,
+  "error": "Write tools are disabled. Set allow_write_tools=true in config to enable gated write commands."
+}
+```
+
+**Refusal (no --confirm):**
+```json
+{
+  "ok": false,
+  "error": "Refusing to create PR without --confirm."
+}
+```
+
+**Refusal (on main branch):**
+```json
+{
+  "ok": false,
+  "error": "Refusing to create PR from main branch."
+}
+```
+
+**Success:**
+```json
+{
+  "ok": true,
+  "repository": "MerverliPy/calvin-opencode-system",
+  "title": "Add feature",
+  "base": "main",
+  "head": "feature-branch",
+  "url": "https://github.com/MerverliPy/calvin-opencode-system/pull/42",
+  "write_action": "pr_create"
+}
+```
+
+### Disposable Branch Testing
+
+**Always test PR creation on a disposable branch**, never on `main` or a
+production branch. Create a throwaway branch:
+
+```bash
+git checkout -b test-pr-create-disposable
+echo "test" > /tmp/test-pr-body.md
+# Enable write tools, then:
+python3 tools/github-multitool/github_multitool.py pr-create \
+  --title "TEST: disposable branch" \
+  --body-file /tmp/test-pr-body.md \
+  --base main \
+  --head current \
+  --confirm
+```
+
+Close the test PR immediately after verifying the command works.
+
+### Server Endpoint
+
+**POST /pr/create is deferred/disabled.** The CLI command (`pr-create`) works
+when write tools are enabled, but the server does not expose a write endpoint.
+All POST, PUT, and DELETE requests are rejected with HTTP 405.
+
+### Security
+
+- Does not store, read, or print GitHub tokens.
+- Uses `gh` authentication boundary only.
+- Runs `gh pr create` via subprocess argument list (no `shell=True`).
+- Does not print credentials, cookies, or secret values.
+- Body file is read from disk by `gh`, not by this tool.
 
 
 ## Smoke Test

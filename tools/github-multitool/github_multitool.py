@@ -95,6 +95,72 @@ def resolve_repo(config: dict[str, Any], requested_repo: str | None) -> str:
     return repo
 
 
+
+
+
+# ---------------------------------------------------------------------------
+# Write tool safety gates (Feature 5: Safe PR Creator)
+# ---------------------------------------------------------------------------
+
+
+def _check_allow_write_tools(config: dict[str, Any]) -> None:
+    """Raise ToolError if write tools are disabled in config."""
+    if not config.get("allow_write_tools", False):
+        raise ToolError(
+            "Write tools are disabled. "
+            "Set allow_write_tools=true in config to enable gated write commands."
+        )
+
+
+def _git_working_tree_clean() -> bool:
+    """Return True if git working tree is clean (no uncommitted changes)."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0 and result.stdout.strip() == ""
+
+
+def _git_current_branch() -> str:
+    """Return the current git branch name."""
+    result = subprocess.run(
+        ["git", "branch", "--show-current"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ToolError(
+            "Failed to determine current branch: "
+            + (result.stderr.strip() or "not in a git repository")
+        )
+    return result.stdout.strip()
+
+
+def _branch_ahead_count(base: str, head: str) -> int:
+    """Return number of commits *head* is ahead of *base*.
+
+    Prefers origin/<base> when available, falls back to local <base>.
+    """
+    for base_ref in (f"origin/{base}", base):
+        result = subprocess.run(
+            ["git", "rev-list", "--count", f"{base_ref}..{head}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            try:
+                return int(result.stdout.strip())
+            except ValueError:
+                continue
+    raise ToolError(
+        f"Failed to count commits ahead: could not compare {base}..{head}"
+    )
+
+
 def run_gh_json(args: list[str]) -> Any:
     require_gh()
 
@@ -1242,6 +1308,166 @@ def cmd_run_explain(config: dict[str, Any], args: argparse.Namespace) -> int:
     print_json(output)
     return 0
 
+
+# ---------------------------------------------------------------------------
+# Feature 5: Safe PR Creator
+# ---------------------------------------------------------------------------
+
+
+def cmd_pr_create(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Create a pull request with heavy safety gates.
+
+    All of the following must pass before a PR is created:
+
+    1. allow_write_tools is true in config.
+    2. --confirm is present.
+    3. Current branch is not main or master.
+    4. Working tree is clean.
+    5. Branch has commits ahead of base.
+    6. PR title is non-empty.
+    7. Body file exists.
+    8. Repository is allowlisted.
+    9. Repository visibility guard does not block.
+    """
+    # Gate 1: --confirm flag present
+    if not getattr(args, "confirm", False):
+        print_json({"ok": False, "error": "Refusing to create PR without --confirm."})
+        return 1
+
+    # Gate 2: Write tools enabled
+    if not config.get("allow_write_tools", False):
+        print_json({
+            "ok": False,
+            "error": (
+                "Write tools are disabled. "
+                "Set allow_write_tools=true in config to enable gated write commands."
+            ),
+        })
+        return 1
+
+    # Gate 3: PR title is non-empty
+    title = (getattr(args, "title", "") or "").strip()
+    if not title:
+        print_json({"ok": False, "error": "PR title must be non-empty."})
+        return 1
+
+    # Gate 4: Body file exists
+    body_file = getattr(args, "body_file", "")
+    if not body_file:
+        print_json({"ok": False, "error": "Refusing to create PR without --body-file."})
+        return 1
+
+    body_path = Path(body_file)
+    if not body_path.exists():
+        print_json({
+            "ok": False,
+            "error": f"Refusing to create PR: body file does not exist: {body_file}",
+        })
+        return 1
+
+    # Gate 5: Repository is allowlisted (resolve_repo enforces allowlist)
+    repo = resolve_repo(config, args.repo)
+
+    # Determine base branch
+    base = getattr(args, "base", "main") or "main"
+
+    # Determine head branch: resolve "current" to actual branch name
+    head_raw = getattr(args, "head", "")
+    if not head_raw:
+        print_json({"ok": False, "error": "Refusing to create PR without --head."})
+        return 1
+
+    if head_raw == "current":
+        head = _git_current_branch()
+    else:
+        head = head_raw
+
+    # Get current branch for safety checks
+    current_branch = _git_current_branch()
+
+    # Gate 6: Current branch is not main or master
+    if current_branch in ("main", "master"):
+        print_json({"ok": False, "error": "Refusing to create PR from main branch."})
+        return 1
+
+    # Gate 7: Working tree is clean
+    if not _git_working_tree_clean():
+        print_json({
+            "ok": False,
+            "error": (
+                "Refusing to create PR: working tree is not clean. "
+                "Commit or stash changes first."
+            ),
+        })
+        return 1
+
+    # Gate 8: Branch has commits ahead of base
+    ahead = _branch_ahead_count(base, head)
+    if ahead == 0:
+        print_json({
+            "ok": False,
+            "error": (
+                f"Refusing to create PR: head branch '{head}' "
+                f"has 0 commits ahead of base '{base}'."
+            ),
+        })
+        return 1
+
+    # Gate 9: Repository visibility guard
+    # (handled implicitly by resolve_repo and config validation)
+
+    # ── Safe PR preview (stderr) ──────────────────────────────────
+    preview_lines = [
+        "--- PR Preview ---",
+        f"Repository:     {repo}",
+        f"Title:          {title}",
+        f"Base:           {base}",
+        f"Head:           {head}",
+        f"Body file:      {body_path}",
+        f"Commits ahead:  {ahead}",
+        f"Current branch: {current_branch}",
+        "--- Creating PR ---",
+    ]
+    print("\n".join(preview_lines), file=sys.stderr)
+
+    # ── Execute gh pr create ──────────────────────────────────────
+    result = subprocess.run(
+        [
+            "gh", "pr", "create",
+            "--repo", repo,
+            "--title", title,
+            "--body-file", str(body_path),
+            "--base", base,
+            "--head", head,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        print_json({
+            "ok": False,
+            "error": result.stderr.strip() or "gh pr create failed",
+        })
+        return 2
+
+    url = result.stdout.strip()
+
+    output = {
+        "ok": True,
+        "repository": repo,
+        "title": title,
+        "base": base,
+        "head": head,
+        "url": url,
+        "write_action": "pr_create",
+    }
+    print_json(output)
+    return 0
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="github_multitool.py",
@@ -1304,6 +1530,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("run_id", type=int, help="The run database ID to explain.")
     p.add_argument("--log-lines", type=int, default=80, help="Max log lines to return (default: 80).")
     p.set_defaults(func=cmd_run_explain)
+
+
+    p = sub.add_parser("pr-create", help="Create a pull request (gated write tool).")
+    p.add_argument("--title", required=True, help="PR title.")
+    p.add_argument("--body-file", required=True, help="Path to PR body Markdown file.")
+    p.add_argument("--base", default="main", help="Base branch for the PR (default: main).")
+    p.add_argument(
+        "--head",
+        default="current",
+        help='Head branch for the PR. Use "current" to resolve the current branch (default: current).',
+    )
+    p.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Required confirmation flag. The command refuses without this flag.",
+    )
+    p.set_defaults(func=cmd_pr_create)
 
 
     return parser
