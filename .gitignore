@@ -41,3 +41,7 @@ Thumbs.db
 dist/
 build/
 coverage/
+
+# GitHub localhost multitool local files
+tools/github-multitool/config.json
+tools/github-multitool/*.log

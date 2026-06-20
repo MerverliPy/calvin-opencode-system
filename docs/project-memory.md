@@ -89,3 +89,19 @@ Use this file for durable repo-specific context.
   ~~~~
 
 - Generated `dist/` files remain uncommitted by default.
+
+## GitHub Localhost Multitool
+
+- The GitHub multitool is a localhost-only utility under `tools/github-multitool/`.
+- The MVP is read-only and uses GitHub CLI `gh` as the backend.
+- Local config and logs are ignored:
+  - `tools/github-multitool/config.json`
+  - `tools/github-multitool/*.log`
+- The smoke test command is:
+
+  ~~~~bash
+  tools/github-multitool/smoke-test.sh
+  ~~~~
+
+- Write tools must remain gated behind explicit confirmation.
+- The server must bind only to `127.0.0.1` or `localhost`.
