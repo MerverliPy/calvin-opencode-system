@@ -21,6 +21,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from config_validation import ConfigError, repo_visibility_warnings, validate_config
+
 
 DEFAULT_CONFIG = {
     "host": "127.0.0.1",
@@ -29,6 +31,8 @@ DEFAULT_CONFIG = {
     "allowed_repositories": ["MerverliPy/calvin-opencode-system"],
     "backend": "gh",
     "allow_write_tools": False,
+    "warn_public_repositories": True,
+    "strict_private": False,
 }
 
 
@@ -61,7 +65,7 @@ def load_config(root: Path) -> dict[str, Any]:
             config.update(loaded)
             break
 
-    return config
+    return validate_config(config)
 
 
 def print_json(payload: dict[str, Any] | list[Any]) -> None:
@@ -122,6 +126,8 @@ def cmd_health(config: dict[str, Any], args: argparse.Namespace) -> int:
         "host": config.get("host"),
         "localhost_only": config.get("host") in ("127.0.0.1", "localhost"),
         "allow_write_tools": bool(config.get("allow_write_tools", False)),
+        "warn_public_repositories": bool(config.get("warn_public_repositories", True)),
+        "strict_private": bool(config.get("strict_private", False)),
         "default_repository": config.get("default_repository"),
         "allowed_repositories": config.get("allowed_repositories", []),
     }
@@ -138,6 +144,15 @@ def cmd_repo_status(config: dict[str, Any], args: argparse.Namespace) -> int:
         "--json",
         "nameWithOwner,description,visibility,isPrivate,defaultBranchRef,url",
     ])
+
+    warnings = repo_visibility_warnings(
+        payload,
+        config,
+        strict_private=bool(getattr(args, "strict_private", False)),
+    )
+    if warnings:
+        payload["safety_warnings"] = warnings
+
     print_json(payload)
     return 0
 
@@ -240,6 +255,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_health)
 
     p = sub.add_parser("repo-status", help="Show repository metadata.")
+    p.add_argument(
+        "--strict-private",
+        action="store_true",
+        help="Fail if the repository is public.",
+    )
     p.set_defaults(func=cmd_repo_status)
 
     p = sub.add_parser("prs-list", help="List pull requests.")
@@ -275,7 +295,7 @@ def main() -> int:
 
     try:
         return args.func(config, args)
-    except ToolError as exc:
+    except (ToolError, ConfigError) as exc:
         print_json({"ok": False, "error": str(exc)})
         return 2
 
