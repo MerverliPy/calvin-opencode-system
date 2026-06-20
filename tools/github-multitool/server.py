@@ -15,6 +15,7 @@ Read-only MVP endpoints:
 - GET /pr/<number>/readiness
 - GET /run/<run_id>/explain
 - GET /security/summary
+- GET /branch/<branch>/protection
 
 Write endpoints (deferred/disabled):
 - POST /pr/create    — CLI command exists (pr-create) but server endpoint is
@@ -35,7 +36,7 @@ import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from config_validation import ConfigError, validate_config
 
@@ -205,6 +206,17 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/security/summary":
             code, payload = run_cli([*base_args, "security-summary"])
+            self.send_json(200 if code == 0 else 500, payload)
+            return
+
+        if path.startswith("/branch/") and path.endswith("/protection"):
+            parts = path.split("/")
+            if len(parts) < 4 or not parts[2]:
+                self.reject(400, "Branch name is required.")
+                return
+            raw_branch = parts[2]
+            branch = unquote(raw_branch)
+            code, payload = run_cli([*base_args, "branch-protection", branch])
             self.send_json(200 if code == 0 else 500, payload)
             return
 

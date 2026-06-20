@@ -2894,6 +2894,142 @@ def cmd_security_summary(config: dict[str, Any], args: argparse.Namespace) -> in
     return 0 if result.get("ok") else 2
 
 
+# ---------------------------------------------------------------------------
+# Feature 11: Branch Protection Inspector helpers and command
+# ---------------------------------------------------------------------------
+
+
+def inspect_branch_protection(repo: str, branch: str) -> dict[str, Any]:
+    """Inspect branch protection rules for *branch* via gh api.
+
+    Returns a stable JSON dict with all protection fields normalized.
+    404 (no protection configured) and 403 (permission denied) are
+    handled gracefully without crashing.
+    """
+    require_gh()
+
+    base: dict[str, Any] = {
+        "ok": True,
+        "repository": repo,
+        "branch": branch,
+        "protected": False,
+        "requires_pull_request": False,
+        "required_approving_reviews": 0,
+        "dismisses_stale_reviews": False,
+        "requires_status_checks": False,
+        "required_status_check_contexts": [],
+        "strict_status_checks": False,
+        "requires_linear_history": False,
+        "allows_force_pushes": None,
+        "allows_deletions": None,
+        "admin_enforcement": False,
+        "restrictions": {
+            "users": [],
+            "teams": [],
+            "apps": [],
+        },
+        "raw_availability": "not_protected_or_unavailable",
+        "recommended_next_action": (
+            f"Enable branch protection for {branch} if this repository "
+            "should require reviewed changes."
+        ),
+    }
+
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/branches/{branch}/protection"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "404" in stderr:
+            return base
+        if "403" in stderr:
+            base["protected"] = None
+            base["raw_availability"] = "permission_denied_or_unavailable"
+            base["recommended_next_action"] = (
+                "Verify GitHub permissions to view branch protection rules."
+            )
+            return base
+        base["raw_availability"] = f"api_error: {stderr[:200]}"
+        base["recommended_next_action"] = (
+            "Verify GitHub CLI authentication and repository access."
+        )
+        return base
+
+    stdout = result.stdout.strip()
+    if not stdout:
+        return base  # empty response → no protection
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        base["raw_availability"] = "unexpected_non_json_response"
+        return base
+
+    if not isinstance(data, dict) or not data:
+        return base
+
+    base["protected"] = True
+    base["raw_availability"] = "available"
+    base["recommended_next_action"] = (
+        "Branch protection is active. Review the rules below for consistency."
+    )
+
+    rp = data.get("required_pull_request_reviews")
+    if isinstance(rp, dict):
+        base["requires_pull_request"] = bool(rp)
+        base["required_approving_reviews"] = rp.get(
+            "required_approving_review_count", 0
+        )
+        base["dismisses_stale_reviews"] = bool(
+            rp.get("dismiss_stale_reviews", False)
+        )
+
+    sc = data.get("required_status_checks")
+    if isinstance(sc, dict):
+        base["requires_status_checks"] = bool(sc)
+        base["required_status_check_contexts"] = sc.get("contexts", []) or []
+        base["strict_status_checks"] = bool(sc.get("strict", False))
+
+    rlh = data.get("required_linear_history")
+    if isinstance(rlh, dict):
+        base["requires_linear_history"] = bool(rlh.get("enabled", False))
+
+    afp = data.get("allow_force_pushes")
+    if isinstance(afp, dict):
+        base["allows_force_pushes"] = bool(afp.get("enabled", False))
+
+    ad = data.get("allow_deletions")
+    if isinstance(ad, dict):
+        base["allows_deletions"] = bool(ad.get("enabled", False))
+
+    ea = data.get("enforce_admins")
+    if isinstance(ea, dict):
+        base["admin_enforcement"] = bool(ea.get("enabled", False))
+    elif isinstance(ea, bool):
+        base["admin_enforcement"] = ea
+
+    rest = data.get("restrictions")
+    if isinstance(rest, dict):
+        base["restrictions"] = {
+            "users": list(rest.get("users", []) or []),
+            "teams": list(rest.get("teams", []) or []),
+            "apps": list(rest.get("apps", []) or []),
+        }
+
+    return base
+
+
+def cmd_branch_protection(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Inspect branch protection rules for a named branch."""
+    repo = resolve_repo(config, args.repo)
+    branch = args.branch
+    result = inspect_branch_protection(repo, branch)
+    print_json(result)
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2992,6 +3128,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("security-summary", help="Summarize GitHub security posture (read-only).")
     p.set_defaults(func=cmd_security_summary)
 
+    p = sub.add_parser("branch-protection", help="Inspect branch protection rules (read-only).")
+    p.add_argument("branch", help="Branch name to inspect (e.g. main).")
+    p.set_defaults(func=cmd_branch_protection)
 
     return parser
 

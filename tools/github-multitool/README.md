@@ -1035,6 +1035,98 @@ of security.
 - Handles 401, 403, 404, and missing permissions gracefully.
 - Returns stable JSON output.
 
+## Branch Protection Inspector (Feature 11)
+
+Inspect branch protection rules for the default branch or any named branch
+using a single read-only GitHub API call.  The tool normalizes the API
+response into a stable, predictable JSON schema whether or not protection
+rules exist.
+
+### Usage
+
+```bash
+python3 tools/github-multitool/github_multitool.py branch-protection <BRANCH>
+```
+
+### CLI Example
+
+```bash
+python3 tools/github-multitool/github_multitool.py branch-protection main
+```
+
+### Server Endpoint
+
+```bash
+curl -s http://127.0.0.1:8765/branch/main/protection
+```
+
+### 404 Handling (No Protection Configured)
+
+When no branch protection rules exist for the requested branch, the GitHub
+API returns 404.  The tool handles this gracefully and returns:
+
+- `protected`: `false`
+- `raw_availability`: `"not_protected_or_unavailable"`
+- `ok`: `true`
+- All protection subfields initialized to safe defaults (`false`, `0`, `[]`).
+
+This is a normal and expected response — many repositories do not have
+branch protection configured.
+
+### 403 Handling (Permission Denied / Unavailable)
+
+When the authenticated user does not have permission to view branch
+protection rules, the GitHub API returns 403.  The tool handles this
+gracefully and returns:
+
+- `protected`: `null`
+- `raw_availability`: `"permission_denied_or_unavailable"`
+- `ok`: `true`
+
+### Expected Output Shape
+
+```json
+{
+  "ok": true,
+  "repository": "MerverliPy/calvin-opencode-system",
+  "branch": "main",
+  "protected": false,
+  "requires_pull_request": false,
+  "required_approving_reviews": 0,
+  "dismisses_stale_reviews": false,
+  "requires_status_checks": false,
+  "required_status_check_contexts": [],
+  "strict_status_checks": false,
+  "requires_linear_history": false,
+  "allows_force_pushes": null,
+  "allows_deletions": null,
+  "admin_enforcement": false,
+  "restrictions": {
+    "users": [],
+    "teams": [],
+    "apps": []
+  },
+  "raw_availability": "not_protected_or_unavailable",
+  "recommended_next_action": "Enable branch protection for main if this repository should require reviewed changes."
+}
+```
+
+When protection rules are active, all boolean and count fields are populated
+from the API response, `raw_availability` is `"available"`, and
+`recommended_next_action` confirms that protection is active.
+
+### Safety
+
+- Read-only: uses `gh api repos/<owner>/<repo>/branches/<branch>/protection`.
+- Does not create, modify, or delete branch protection rules.
+- Does not print tokens, credentials, or secret values.
+- Uses subprocess argument lists (no `shell=True`).
+- Handles 404 (no protection), 403 (permission denied), and other API errors
+  gracefully.
+- Returns stable JSON output regardless of GitHub plan tier or feature
+  availability.
+
+
 ## Smoke Test
 
 Run the local smoke test:

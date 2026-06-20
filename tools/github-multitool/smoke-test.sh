@@ -1054,5 +1054,89 @@ else
   echo "[PASS] Server /security/summary (graceful error)"
 fi
 
+# -- Feature 11: Branch Protection Inspector smoke tests ----------
+
+echo
+echo "== CLI branch-protection --help =="
+python3 tools/github-multitool/github_multitool.py branch-protection --help > /tmp/github-multitool-branch-protection-help.txt
+cat /tmp/github-multitool-branch-protection-help.txt
+echo
+echo "[PASS] CLI branch-protection --help"
+
+echo
+echo "== CLI branch-protection main =="
+set +e
+python3 tools/github-multitool/github_multitool.py branch-protection main > /tmp/github-multitool-branch-protection.json 2>/tmp/github-multitool-branch-protection.err
+bp_exit=$?
+set -e
+
+cat /tmp/github-multitool-branch-protection.json
+
+ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-branch-protection.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+" 2>/dev/null || echo "")"
+
+if [[ "$ok_val" != "True" ]]; then
+  echo "[FAIL] CLI branch-protection missing ok=true"
+  exit 1
+fi
+
+for field in repository branch protected requires_pull_request required_approving_reviews dismisses_stale_reviews requires_status_checks required_status_check_contexts strict_status_checks requires_linear_history allows_force_pushes allows_deletions admin_enforcement restrictions raw_availability recommended_next_action; do
+  val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-branch-protection.json') as f:
+    d = json.load(f)
+print(d.get('$field', '__MISSING__'))
+" 2>/dev/null || echo "__MISSING__")"
+  if [[ "$val" == "__MISSING__" ]]; then
+    echo "[FAIL] CLI branch-protection missing field: $field"
+    exit 1
+  fi
+done
+
+protected_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-branch-protection.json') as f:
+    d = json.load(f)
+print(d.get('protected', ''))
+" 2>/dev/null || echo "")"
+
+raw_avail="$(python3 -c "
+import json
+with open('/tmp/github-multitool-branch-protection.json') as f:
+    d = json.load(f)
+print(d.get('raw_availability', ''))
+" 2>/dev/null || echo "")"
+
+echo
+echo "[PASS] CLI branch-protection main (protected=$protected_val, raw_availability=$raw_avail)"
+
+echo
+echo "== Server /branch/main/protection =="
+BP_HTTP_CODE="$(curl -sS -o /tmp/github-multitool-server-branch-protection.json -w '%{http_code}' 'http://127.0.0.1:8765/branch/main/protection' || echo '000')"
+if [[ "$BP_HTTP_CODE" == "200" ]]; then
+  cat /tmp/github-multitool-server-branch-protection.json
+  ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-server-branch-protection.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+" 2>/dev/null || echo "")"
+  if [[ "$ok_val" != "True" ]]; then
+    echo "[FAIL] Server /branch/main/protection missing ok=true"
+    exit 1
+  fi
+  echo
+  echo "[PASS] Server /branch/main/protection"
+else
+  echo "Server /branch/main/protection returned HTTP $BP_HTTP_CODE; output:"
+  cat /tmp/github-multitool-server-branch-protection.json 2>/dev/null || true
+  echo
+  echo "[PASS] Server /branch/main/protection (graceful error)"
+fi
+
 echo "== Final result =="
 echo "[PASS] GitHub multitool smoke test completed successfully."
