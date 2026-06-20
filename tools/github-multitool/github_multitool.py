@@ -1833,6 +1833,246 @@ def cmd_pr_body(config: dict[str, Any], args: argparse.Namespace) -> int:
     }
     print_json(result)
     return 0
+# ---------------------------------------------------------------------------
+# Feature 7: Branch Cleanup Advisor helpers and command
+# ---------------------------------------------------------------------------
+
+def _git_list_local_branches() -> list[str]:
+    """List local branch names via git branch --format."""
+    result = subprocess.run(
+        ["git", "branch", "--format=%(refname:short)"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ToolError(
+            "Failed to list local branches: "
+            + (result.stderr.strip() or "unknown error")
+        )
+    return [b.strip() for b in result.stdout.strip().split("\n") if b.strip()]
+
+
+def _git_list_remote_branches() -> list[str]:
+    """List remote tracking branches (origin/* only, excluding HEAD)."""
+    result = subprocess.run(
+        ["git", "branch", "-r", "--format=%(refname:short)"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    all_remote = [b.strip() for b in result.stdout.strip().split("\n") if b.strip()]
+    return [
+        b for b in all_remote
+        if b.startswith("origin/") and "->" not in b and not b.endswith("/HEAD")
+    ]
+
+
+def _git_get_merged_branches(target: str, *, remote: bool = False) -> set[str]:
+    """Return branches merged into *target*.
+
+    When *remote* is True, uses ``git branch -r --merged``.
+    Returns an empty set on failure.
+    """
+    if remote:
+        cmd = ["git", "branch", "-r", "--merged", target, "--format=%(refname:short)"]
+    else:
+        cmd = ["git", "branch", "--merged", target, "--format=%(refname:short)"]
+    result = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        return set()
+    branches = {b.strip() for b in result.stdout.strip().split("\n") if b.strip()}
+    if remote:
+        branches = {
+            b for b in branches
+            if b.startswith("origin/") and "->" not in b and not b.endswith("/HEAD")
+        }
+    return branches
+
+
+def _get_default_branch(repo: str) -> str:
+    """Determine the default branch for *repo*.
+
+    Tries ``gh repo view --json defaultBranchRef`` first,
+    then falls back to ``git symbolic-ref refs/remotes/origin/HEAD``,
+    and finally returns ``"main"``.
+    """
+    try:
+        data = run_gh_json(["repo", "view", repo, "--json", "defaultBranchRef"])
+        ref = data.get("defaultBranchRef") or {}
+        if isinstance(ref, dict):
+            name = ref.get("name")
+            if name:
+                return name
+    except ToolError:
+        pass
+
+    # Local fallback
+    result = subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        ref = result.stdout.strip()
+        return ref.split("/")[-1] if "/" in ref else ref
+
+    return "main"
+
+
+def _get_open_pr_branches(repo: str) -> set[str]:
+    """Return the set of headRefName values for open PRs in *repo*."""
+    try:
+        prs = run_gh_json([
+            "pr", "list",
+            "--repo", repo,
+            "--state", "open",
+            "--limit", "200",
+            "--json", "headRefName",
+        ])
+    except ToolError:
+        return set()
+    if not isinstance(prs, list):
+        return set()
+    return {pr.get("headRefName", "") for pr in prs if isinstance(pr, dict)}
+
+
+def cmd_branches_cleanup_plan(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Branch Cleanup Advisor: identify local and remote branches safe to delete.
+
+    This command is strictly read-only.  It never deletes anything.
+    """
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+
+    # ── Gather data ─────────────────────────────────────────────────
+    default_branch = _get_default_branch(repo)
+    current_branch = _git_current_branch()
+
+    try:
+        local_branches = _git_list_local_branches()
+    except ToolError as exc:
+        print_json({"ok": False, "error": str(exc)})
+        return 2
+
+    remote_branches = _git_list_remote_branches()
+
+    # Determine which branches are merged into default (local + remote)
+    merged_local = _git_get_merged_branches(default_branch, remote=False)
+    if not merged_local:
+        # Fallback: try origin/<default> as merge target
+        merged_local = _git_get_merged_branches(f"origin/{default_branch}", remote=False)
+
+    merged_remote = _git_get_merged_branches(f"origin/{default_branch}", remote=True)
+
+    # Open PR branches
+    open_pr_branches = _get_open_pr_branches(repo)
+
+    # ── Classify ────────────────────────────────────────────────────
+    protected = {"main", "master", default_branch}
+
+    do_not_delete: list[dict[str, str]] = []
+    safe_local: list[dict[str, str]] = []
+    safe_remote: list[dict[str, str]] = []
+    manual_review: list[dict[str, str]] = []
+
+    # --- Local branches ---
+    for branch in local_branches:
+        if branch in protected:
+            do_not_delete.append({
+                "branch": branch,
+                "reason": "Default branch.",
+            })
+            continue
+
+        if branch == current_branch:
+            do_not_delete.append({
+                "branch": branch,
+                "reason": "Current checked-out branch.",
+            })
+            continue
+
+        if branch in open_pr_branches:
+            do_not_delete.append({
+                "branch": branch,
+                "reason": "Has an open pull request.",
+            })
+            continue
+
+        if branch in merged_local:
+            safe_local.append({
+                "branch": branch,
+                "reason": f"Merged into {default_branch} and has no open PR.",
+                "suggested_command": f"git branch -d {branch}",
+            })
+        else:
+            manual_review.append({
+                "branch": branch,
+                "reason": f"Not merged into {default_branch} and has no open PR.",
+            })
+
+    # --- Remote branches (origin/*) ---
+    merged_remote_raw: set[str] = {b.replace("origin/", "", 1) for b in merged_remote}
+
+    for remote_branch in remote_branches:
+        raw_name = remote_branch.replace("origin/", "", 1)
+
+        if raw_name in protected:
+            do_not_delete.append({
+                "branch": remote_branch,
+                "reason": "Default branch (remote tracking).",
+            })
+            continue
+
+        if raw_name == current_branch:
+            do_not_delete.append({
+                "branch": remote_branch,
+                "reason": "Remote tracking for current checked-out branch.",
+            })
+            continue
+
+        if raw_name in open_pr_branches:
+            do_not_delete.append({
+                "branch": remote_branch,
+                "reason": "Has an open pull request.",
+            })
+            continue
+
+        if raw_name in merged_remote_raw:
+            safe_remote.append({
+                "branch": remote_branch,
+                "reason": f"Remote branch appears merged into {default_branch} and has no open PR.",
+                "suggested_command": f"git push origin --delete {raw_name}",
+            })
+        elif merged_remote:
+            # We have a merged list, and this branch is not in it
+            manual_review.append({
+                "branch": remote_branch,
+                "reason": f"Remote branch not merged into {default_branch}.",
+            })
+        else:
+            manual_review.append({
+                "branch": remote_branch,
+                "reason": "Remote merge state could not be determined (origin tracking may be stale).",
+            })
+
+    # ── Build output ────────────────────────────────────────────────
+    output: dict[str, Any] = {
+        "ok": True,
+        "repository": repo,
+        "default_branch": default_branch,
+        "current_branch": current_branch,
+        "safe_to_delete_local": safe_local,
+        "safe_to_delete_remote": safe_remote,
+        "needs_manual_review": manual_review,
+        "do_not_delete": do_not_delete,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    print_json(output)
+    return 0
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1915,7 +2155,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_pr_create)
 
     p = sub.add_parser("pr-body", help="Generate a local PR body Markdown file from commits and changed files.")
+
     p.set_defaults(func=cmd_pr_body)
+    p = sub.add_parser("branches-cleanup-plan", help="Branch Cleanup Advisor: identify branches safe to delete (advisory only).")
+    p.set_defaults(func=cmd_branches_cleanup_plan)
+
 
 
 

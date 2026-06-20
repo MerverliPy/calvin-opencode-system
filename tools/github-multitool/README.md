@@ -591,6 +591,97 @@ This ensures the generator is honest and never invents successful verification.
 - Raises an error if neither base branch is available.
 
 
+
+## Branch Cleanup Advisor (Feature 7)
+
+Identify local and remote branches that are likely safe to delete, but **never
+delete anything automatically**. This command is strictly advisory and
+read-only.
+
+### Usage
+
+```bash
+python3 tools/github-multitool/github_multitool.py branches-cleanup-plan
+```
+
+### Advisory Only
+
+- This command **never deletes branches**.
+- All suggested commands must be **reviewed and executed manually**.
+- The tool classifies branches into four categories.
+
+### Categories
+
+| Category               | Meaning                                                              |
+|------------------------|----------------------------------------------------------------------|
+| `safe_to_delete_local` | Local branches merged into the default branch with no open PRs.     |
+| `safe_to_delete_remote`| Remote branches (`origin/*`) merged into default with no open PRs.   |
+| `needs_manual_review`  | Unmerged branches, stale branches, or branches with unknown status. |
+| `do_not_delete`        | Default branch, current branch, `main`/`master`, or has open PR.    |
+
+### Suggested Commands
+
+Each entry in `safe_to_delete_local` and `safe_to_delete_remote` includes a
+`suggested_command` field. **Never run these without review.**
+
+- **Local delete**: `git branch -d <branch>`
+- **Remote delete**: `git push origin --delete <branch>`
+
+Force-delete variants (`-D`) are intentionally excluded from safe suggestions.
+
+### Classification Rules
+
+| Condition                                      | Classification         |
+|------------------------------------------------|------------------------|
+| Default branch (`main`, `master`, etc.)        | `do_not_delete`        |
+| Current checked-out branch                     | `do_not_delete`        |
+| Branch with an open pull request               | `do_not_delete`        |
+| Merged into default branch, no open PR         | `safe_to_delete_local` |
+| Remote merged into default, no open PR         | `safe_to_delete_remote`|
+| Not merged, no open PR                         | `needs_manual_review`  |
+| Remote merge state undetectable                | `needs_manual_review`  |
+
+### Expected Output
+
+```json
+{
+  "ok": true,
+  "repository": "MerverliPy/calvin-opencode-system",
+  "default_branch": "main",
+  "current_branch": "feature-branch",
+  "safe_to_delete_local": [
+    {
+      "branch": "old-merged-branch",
+      "reason": "Merged into main and has no open PR.",
+      "suggested_command": "git branch -d old-merged-branch"
+    }
+  ],
+  "safe_to_delete_remote": [
+    {
+      "branch": "origin/old-merged-branch",
+      "reason": "Remote branch appears merged into main and has no open PR.",
+      "suggested_command": "git push origin --delete old-merged-branch"
+    }
+  ],
+  "needs_manual_review": [],
+  "do_not_delete": [
+    {
+      "branch": "main",
+      "reason": "Default branch."
+    }
+  ],
+  "generated_at": "2026-06-20T12:00:00.123456+00:00"
+}
+```
+
+### Safety
+
+- **Strictly read-only**: uses `git branch`, `gh repo view`, and `gh pr list`.
+- Does not create, delete, push, or modify branches.
+- Does not print tokens, credentials, or secret values.
+- Handles missing `gh` permissions gracefully.
+- Uses subprocess argument lists (no `shell=True`).
+
 ## Smoke Test
 
 Run the local smoke test:

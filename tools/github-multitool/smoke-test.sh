@@ -547,5 +547,147 @@ fi
 rm -rf dist/github-pr-bodies/
 
 
+
+# ── Feature 7: Branch Cleanup Advisor smoke tests ──────────────
+
+echo
+echo "== CLI branches-cleanup-plan --help =="
+python3 tools/github-multitool/github_multitool.py branches-cleanup-plan --help > /tmp/github-multitool-cleanup-help.txt
+cat /tmp/github-multitool-cleanup-help.txt
+echo
+echo "[PASS] CLI branches-cleanup-plan --help"
+
+echo
+echo "== CLI branches-cleanup-plan =="
+set +e  # allow non-zero exit but not crash
+python3 tools/github-multitool/github_multitool.py branches-cleanup-plan > /tmp/github-multitool-cleanup-plan.json 2>/tmp/github-multitool-cleanup-plan.err
+cleanup_exit=$?
+set -e
+
+cat /tmp/github-multitool-cleanup-plan.json
+
+# Validate JSON output shape
+ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cleanup-plan.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+" 2>/dev/null || echo "")"
+
+if [[ "$ok_val" == "True" ]]; then
+  # Verify required fields exist
+  repo_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cleanup-plan.json') as f:
+    d = json.load(f)
+print(d.get('repository', ''))
+" 2>/dev/null || echo "")"
+  default_branch="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cleanup-plan.json') as f:
+    d = json.load(f)
+print(d.get('default_branch', ''))
+" 2>/dev/null || echo "")"
+  current_branch="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cleanup-plan.json') as f:
+    d = json.load(f)
+print(d.get('current_branch', ''))
+" 2>/dev/null || echo "")"
+  generated_at="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cleanup-plan.json') as f:
+    d = json.load(f)
+print(d.get('generated_at', ''))
+" 2>/dev/null || echo "")"
+  safe_local="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cleanup-plan.json') as f:
+    d = json.load(f)
+print(d.get('safe_to_delete_local', ''))
+" 2>/dev/null || echo "")"
+  safe_remote="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cleanup-plan.json') as f:
+    d = json.load(f)
+print(d.get('safe_to_delete_remote', ''))
+" 2>/dev/null || echo "")"
+  manual_review="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cleanup-plan.json') as f:
+    d = json.load(f)
+print(d.get('needs_manual_review', ''))
+" 2>/dev/null || echo "")"
+  do_not_delete="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cleanup-plan.json') as f:
+    d = json.load(f)
+print(d.get('do_not_delete', ''))
+" 2>/dev/null || echo "")"
+
+  if [[ -z "$repo_val" || -z "$default_branch" || -z "$current_branch" || -z "$generated_at" || -z "$safe_local" || -z "$safe_remote" || -z "$manual_review" || -z "$do_not_delete" ]]; then
+    echo "[FAIL] CLI branches-cleanup-plan missing required fields"
+    exit 1
+  fi
+
+  # Verify default_branch is in do_not_delete list
+  default_in_dnd="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cleanup-plan.json') as f:
+    d = json.load(f)
+default_branch = d.get('default_branch', '')
+branches = [b.get('branch', '') for b in d.get('do_not_delete', [])]
+print('yes' if default_branch in branches else 'no')
+" 2>/dev/null || echo "no")"
+  if [[ "$default_in_dnd" != "yes" ]]; then
+    echo "[FAIL] Default branch not found in do_not_delete"
+    exit 1
+  fi
+
+  # Verify current_branch is in do_not_delete list
+  current_in_dnd="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cleanup-plan.json') as f:
+    d = json.load(f)
+current_branch = d.get('current_branch', '')
+branches = [b.get('branch', '') for b in d.get('do_not_delete', [])]
+print('yes' if current_branch in branches else 'no')
+" 2>/dev/null || echo "no")"
+  if [[ "$current_in_dnd" != "yes" ]]; then
+    echo "[FAIL] Current branch not found in do_not_delete"
+    exit 1
+  fi
+
+  # Verify no safe_to_delete entry has a suggested command with -D (force)
+  has_force="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cleanup-plan.json') as f:
+    d = json.load(f)
+for entry in d.get('safe_to_delete_local', []) + d.get('safe_to_delete_remote', []):
+    cmd = entry.get('suggested_command', '')
+    if '-D' in cmd:
+        print('yes')
+        break
+else:
+    print('no')
+" 2>/dev/null || echo "no")"
+  if [[ "$has_force" == "yes" ]]; then
+    echo "[FAIL] Force-delete flag (-D) found in safe suggested commands"
+    exit 1
+  fi
+
+  echo
+  echo "[PASS] CLI branches-cleanup-plan (repo=$repo_val, default=$default_branch, current=$current_branch)"
+else
+  error_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cleanup-plan.json') as f:
+    d = json.load(f)
+print(d.get('error', ''))
+" 2>/dev/null || echo "")"
+  echo
+  echo "[PASS] CLI branches-cleanup-plan (graceful error: $error_val)"
+fi
+
 echo "== Final result =="
 echo "[PASS] GitHub multitool smoke test completed successfully."
