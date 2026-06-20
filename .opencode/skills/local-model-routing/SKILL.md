@@ -29,3 +29,20 @@ Avoid local models for:
 Recommended local context:
 - Start 32k if 64k is unstable.
 - Use 64k only with smaller 4B/7B models or if memory allows.
+
+## Repository-Specific Routing
+
+Use local models first for:
+
+- repository scouting
+- registry consistency checks
+- documentation summaries
+- low-risk audit prep
+- test-output summarization
+
+Escalate to cloud models for:
+
+- multi-file edits
+- security analysis
+- final review before PR merge
+- ambiguous architecture decisions

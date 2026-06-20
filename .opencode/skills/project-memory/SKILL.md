@@ -22,3 +22,16 @@ Do not store:
 - personal data
 - temporary errors
 - raw chat transcripts
+
+## Update Triggers
+
+Update `docs/project-memory.md` after:
+
+- merged workflow changes
+- script or command-router changes
+- agent, command, or skill changes
+- registry changes
+- repeated Termius/iPhone pitfalls
+- accepted verification or security decisions
+
+Keep entries concise and durable.

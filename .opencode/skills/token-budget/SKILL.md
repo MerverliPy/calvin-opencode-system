@@ -22,3 +22,13 @@ Escalation path:
 3. DeepSeek V4 Pro
 4. ChatGPT/OpenAI/Copilot
 5. Claude Pro manual review
+
+## Context Pack Budgeting
+
+For repository-wide AI review:
+
+- generate one upload package with `./scripts/opencode-os.sh audit-prep`
+- prefer uploading `dist/audit-requests/opencode-audit-upload.md`
+- avoid repeatedly uploading raw repository files
+- start a fresh session when context becomes noisy
+- summarize findings before moving to implementation

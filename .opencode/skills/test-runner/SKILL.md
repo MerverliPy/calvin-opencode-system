@@ -12,3 +12,13 @@ Rules:
 - Do not claim tests passed unless actually run.
 - Escalate failures to debugging plan before editing again.
 - In WSL2, keep repo files inside the Linux filesystem for better performance.
+
+## Calvin opencode OS Baseline
+
+For this repository, the preferred baseline verification command is:
+
+~~~~bash
+./scripts/verify-opencode-os.sh
+~~~~
+
+Use `bash -n scripts/*.sh` for quick shell-script-only checks.
