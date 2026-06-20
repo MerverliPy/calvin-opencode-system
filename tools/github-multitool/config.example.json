@@ -1,0 +1,24 @@
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "default_repository": "MerverliPy/calvin-opencode-system",
+  "allowed_repositories": [
+    "MerverliPy/calvin-opencode-system"
+  ],
+  "backend": "gh",
+  "log_file": "tools/github-multitool/github-multitool.log",
+  "allow_write_tools": false,
+  "require_confirmation_for": [
+    "pr-merge",
+    "branch-delete",
+    "issue-close",
+    "repo-settings-change",
+    "secret-write"
+  ],
+  "forbidden_actions": [
+    "print-token",
+    "show-credential",
+    "bind-public",
+    "exfiltrate-secret"
+  ]
+}
