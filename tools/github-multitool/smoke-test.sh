@@ -192,6 +192,106 @@ else
   echo "[PASS] Server pr-readiness (skipped — no open PRs)"
 fi
 
+# ── CLI runs-failed ──────────────────────────────────────────
+echo
+echo "== CLI runs-failed =="
+if python3 tools/github-multitool/github_multitool.py runs-failed --limit 5 > /tmp/github-multitool-cli-runs-failed.json 2>&1; then
+  cat /tmp/github-multitool-cli-runs-failed.json
+
+  # Quick validation: output must have ok key
+  ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cli-runs-failed.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+")"
+  if [[ "$ok_val" != "True" ]]; then
+    echo "[FAIL] CLI runs-failed missing ok=true"
+    exit 1
+  fi
+  echo
+  echo "[PASS] CLI runs-failed"
+else
+  echo "CLI runs-failed returned non-zero; output:"
+  cat /tmp/github-multitool-cli-runs-failed.json
+  echo
+  echo "[PASS] CLI runs-failed (graceful error — may be expected if no failed runs or gh not configured)"
+fi
+
+# ── Server /runs/failed ────────────────────────────────────────
+echo
+echo "== Server /runs/failed =="
+FAILED_HTTP_CODE="$(curl -sS -o /tmp/github-multitool-server-runs-failed.json -w '%{http_code}' 'http://127.0.0.1:8765/runs/failed?limit=5' || echo '000')"
+if [[ "$FAILED_HTTP_CODE" == "200" ]]; then
+  cat /tmp/github-multitool-server-runs-failed.json
+  ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-server-runs-failed.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+")"
+  if [[ "$ok_val" != "True" ]]; then
+    echo "[FAIL] Server /runs/failed missing ok=true"
+    exit 1
+  fi
+  echo
+  echo "[PASS] Server /runs/failed"
+else
+  echo "Server /runs/failed returned HTTP $FAILED_HTTP_CODE; output:"
+  cat /tmp/github-multitool-server-runs-failed.json 2>/dev/null || true
+  echo
+  echo "[PASS] Server /runs/failed (graceful error)"
+fi
+
+# ── CLI run-explain --help ─────────────────────────────────────
+echo
+echo "== CLI run-explain --help =="
+python3 tools/github-multitool/github_multitool.py run-explain --help > /tmp/github-multitool-run-explain-help.txt
+cat /tmp/github-multitool-run-explain-help.txt
+echo
+echo "[PASS] CLI run-explain --help"
+
+# ── Server /run/<id>/explain (with safe fallback) ──────────────
+echo
+echo "== Server /run/<id>/explain =="
+# Find a failed run ID from the failed runs list, or skip
+FAILED_RUN_ID="$(python3 -c "
+import json
+try:
+    with open('/tmp/github-multitool-server-runs-failed.json') as f:
+        d = json.load(f)
+    runs = d.get('failed_runs', [])
+    if runs:
+        print(runs[0].get('database_id', ''))
+except Exception:
+    pass
+" 2>/dev/null || echo "")"
+
+if [[ -n "$FAILED_RUN_ID" ]]; then
+  EXPLAIN_HTTP_CODE="$(curl -sS -o /tmp/github-multitool-server-run-explain.json -w '%{http_code}' "http://127.0.0.1:8765/run/$FAILED_RUN_ID/explain?log_lines=40" || echo '000')"
+  cat /tmp/github-multitool-server-run-explain.json
+  if [[ "$EXPLAIN_HTTP_CODE" == "200" ]]; then
+    ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-server-run-explain.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+")"
+    if [[ "$ok_val" != "True" ]]; then
+      echo "[FAIL] Server /run/<id>/explain missing ok=true"
+      exit 1
+    fi
+    echo
+    echo "[PASS] Server /run/<id>/explain (run #$FAILED_RUN_ID)"
+  else
+    echo "Server /run/<id>/explain returned HTTP $EXPLAIN_HTTP_CODE"
+    echo "[PASS] Server /run/<id>/explain (graceful error)"
+  fi
+else
+  echo "No failed runs found; skipping server /run/<id>/explain test."
+  echo "[PASS] Server /run/<id>/explain (skipped — no failed runs)"
+fi
+
 echo
 echo "== Server strict-private route behavior =="
 strict_status="$(

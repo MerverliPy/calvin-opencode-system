@@ -146,6 +146,150 @@ HIGH_RISK_KEYWORDS = [
 STALE_DAYS = 14
 
 
+
+# ---------------------------------------------------------------------------
+# Log redaction and failure classification helpers
+# ---------------------------------------------------------------------------
+
+SENSITIVE_LOG_PATTERNS = [
+    "gh_token",
+    "github_token",
+    "token",
+    "secret",
+    "credential",
+    "password",
+    "cookie",
+    "authorization",
+    "bearer",
+]
+
+
+def _redact_log(log_text: str) -> str:
+    """Redact sensitive-looking log lines before printing or storing."""
+    lines = log_text.split("\n")
+    redacted: list[str] = []
+    for line in lines:
+        lower = line.lower()
+        if any(p in lower for p in SENSITIVE_LOG_PATTERNS):
+            redacted.append("[REDACTED: line matched sensitive pattern]")
+        else:
+            redacted.append(line)
+    return "\n".join(redacted)
+
+
+def _classify_failure(log_text: str) -> dict[str, str]:
+    """Lightweight pattern matching to classify a workflow failure from log text.
+
+    Returns a dict with keys: class, recommended_command, next_step.
+    """
+    lower = log_text.lower()
+
+    # Shell syntax errors (check first — most specific patterns)
+    shell_patterns = [
+        "syntax error", "unexpected token", "command not found",
+        "bad substitution",
+    ]
+    if any(p in lower for p in shell_patterns):
+        return {
+            "class": "shell syntax",
+            "recommended_command": "bash -n <script>",
+            "next_step": "Run bash -n on the failing script to catch syntax errors locally.",
+        }
+
+    # Test failures
+    test_patterns = [
+        "assertionerror", " assertionerror", "pytest", "npm test",
+        "test failed", "test failure",
+    ]
+    # also match FAILED in all-caps (common pytest output) but not the word "failed" alone
+    has_failed_caps = any("FAILED" in part for part in log_text.split("\n") if "FAILED" in part)
+    if any(p in lower for p in test_patterns) or has_failed_caps:
+        return {
+            "class": "test failure",
+            "recommended_command": "tools/github-multitool/smoke-test.sh",
+            "next_step": "Run the matching local verification command and inspect the first failing test.",
+        }
+
+    # Dependency install failures
+    dep_patterns = [
+        "npm err!", "pip install", "no matching distribution found",
+        "could not resolve", "dependency",
+    ]
+    if any(p in lower for p in dep_patterns):
+        return {
+            "class": "dependency install",
+            "recommended_command": "pip install -r requirements.txt  # or npm install",
+            "next_step": "Check that dependency versions are available and compatible with the runner environment.",
+        }
+
+    # Permission / token failures
+    perm_patterns = [
+        "permission denied", "resource not accessible by integration",
+        "bad credentials", "gh_token", "github_token", " 403 ", " 401 ",
+    ]
+    if any(p in lower for p in perm_patterns):
+        return {
+            "class": "permission/token",
+            "recommended_command": "gh auth status",
+            "next_step": "Verify GITHUB_TOKEN permissions and repository secrets configuration.",
+        }
+
+    # Workflow configuration errors
+    wf_patterns = [
+        "invalid workflow file", "the workflow is not valid",
+        ".github/workflows", "mapping values are not allowed",
+    ]
+    if any(p in lower for p in wf_patterns):
+        return {
+            "class": "workflow configuration",
+            "recommended_command": "yamllint .github/workflows/  # or python3 -c 'import yaml; yaml.safe_load(open(\"...\"))'",
+            "next_step": "Validate the workflow YAML file syntax and structure.",
+        }
+
+    # Unknown
+    return {
+        "class": "unknown",
+        "recommended_command": "tools/github-multitool/smoke-test.sh",
+        "next_step": "Inspect failed job logs with run-explain.",
+    }
+
+
+def _fetch_failed_run_log(repo: str, run_id: int, max_lines: int = 200) -> str:
+    """Fetch a limited log excerpt from a failed run's failed steps.
+
+    Uses gh run view --log-failed and returns at most *max_lines*.
+    Returns an empty string if the log is unavailable.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "run", "view", str(run_id), "--repo", repo, "--log-failed"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=45,
+        )
+    except subprocess.TimeoutExpired:
+        return "(log fetch timed out)"
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if stderr:
+            return f"(log unavailable: {stderr})"
+        return ""
+
+    raw = result.stdout.strip()
+    if not raw:
+        return ""
+
+    lines = raw.split("\n")
+    if len(lines) > max_lines:
+        excerpt = "\n".join(lines[:max_lines])
+        excerpt += f"\n... (truncated, {len(lines) - max_lines} more lines)"
+    else:
+        excerpt = raw
+
+    return _redact_log(excerpt)
+
 def _is_high_risk_file(filepath: str) -> bool:
     """Return True if *filepath* matches high-risk directory, file, or keyword."""
     path_lower = filepath.lower()
@@ -983,6 +1127,121 @@ def cmd_runs_list(config: dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
+
+
+# ---------------------------------------------------------------------------
+# Feature 4: GitHub Actions Failure Explainer
+# ---------------------------------------------------------------------------
+
+def cmd_runs_failed(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """List failed GitHub Actions workflow runs with failure classification."""
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+
+    try:
+        runs = run_gh_json([
+            "run", "list",
+            "--repo", repo,
+            "--status", "failure",
+            "--limit", str(args.limit),
+            "--json",
+            "databaseId,workflowName,status,conclusion,createdAt,updatedAt,url,headBranch,event",
+        ])
+    except ToolError as exc:
+        print_json({"ok": False, "error": str(exc)})
+        return 2
+
+    if not isinstance(runs, list):
+        runs = []
+
+    failed_runs: list[dict[str, Any]] = []
+    for run in runs:
+        run_id = run.get("databaseId")
+        if not run_id:
+            continue
+
+        # Best-effort classification: fetch a small log excerpt
+        log_excerpt = _fetch_failed_run_log(repo, run_id, max_lines=150)
+        classification = _classify_failure(log_excerpt)
+
+        entry: dict[str, Any] = {
+            "database_id": run_id,
+            "workflow_name": run.get("workflowName", ""),
+            "status": run.get("status", ""),
+            "conclusion": run.get("conclusion", ""),
+            "branch": run.get("headBranch", ""),
+            "event": run.get("event", ""),
+            "url": run.get("url", ""),
+            "created_at": run.get("createdAt", ""),
+            "updated_at": run.get("updatedAt", ""),
+            "probable_failure_class": classification["class"],
+            "recommended_local_command": classification["recommended_command"],
+            "next_debugging_step": classification["next_step"],
+        }
+        failed_runs.append(entry)
+
+    output = {
+        "ok": True,
+        "repository": repo,
+        "failed_runs": failed_runs,
+        "total_count": len(failed_runs),
+    }
+    print_json(output)
+    return 0
+
+
+def cmd_run_explain(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Explain a failed GitHub Actions workflow run with log excerpts."""
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+    run_id: int = args.run_id
+    log_lines: int = getattr(args, "log_lines", 80)
+
+    # Fetch run metadata
+    try:
+        run_data = run_gh_json([
+            "run", "view", str(run_id),
+            "--repo", repo,
+            "--json",
+            "databaseId,workflowName,status,conclusion,createdAt,updatedAt,url,headBranch,event",
+        ])
+    except ToolError as exc:
+        print_json({"ok": False, "error": str(exc)})
+        return 2
+
+    if not isinstance(run_data, dict):
+        run_data = {}
+
+    # Fetch log excerpt
+    log_excerpt = _fetch_failed_run_log(repo, run_id, max_lines=log_lines)
+
+    # Count actual lines returned (before truncation marker)
+    actual_lines = log_excerpt.count("\n") + 1 if log_excerpt else 0
+
+    # Classify
+    classification = _classify_failure(log_excerpt)
+
+    output = {
+        "ok": True,
+        "repository": repo,
+        "run_id": run_id,
+        "workflow_name": run_data.get("workflowName", ""),
+        "status": run_data.get("status", ""),
+        "conclusion": run_data.get("conclusion", ""),
+        "branch": run_data.get("headBranch", ""),
+        "event": run_data.get("event", ""),
+        "url": run_data.get("url", ""),
+        "created_at": run_data.get("createdAt", ""),
+        "updated_at": run_data.get("updatedAt", ""),
+        "probable_failure_class": classification["class"],
+        "recommended_local_command": classification["recommended_command"],
+        "next_debugging_step": classification["next_step"],
+        "log_excerpt": log_excerpt,
+        "log_lines_returned": actual_lines,
+    }
+    print_json(output)
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="github_multitool.py",
@@ -1036,6 +1295,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("runs-list", help="List GitHub Actions workflow runs.")
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_runs_list)
+
+    p = sub.add_parser("runs-failed", help="List failed GitHub Actions workflow runs with failure classification.")
+    p.add_argument("--limit", type=int, default=10, help="Max failed runs to return (default: 10).")
+    p.set_defaults(func=cmd_runs_failed)
+
+    p = sub.add_parser("run-explain", help="Explain a failed GitHub Actions workflow run.")
+    p.add_argument("run_id", type=int, help="The run database ID to explain.")
+    p.add_argument("--log-lines", type=int, default=80, help="Max log lines to return (default: 80).")
+    p.set_defaults(func=cmd_run_explain)
+
 
     return parser
 

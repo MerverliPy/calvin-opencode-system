@@ -265,6 +265,102 @@ Output files are written to `dist/github-review-packs/` which is gitignored.
 - Metadata appendix redacts sensitive-looking keys.
 
 
+## GitHub Actions Failure Explainer
+
+Identify failed GitHub Actions workflow runs and get concise debugging guidance.
+
+### List Failed Runs
+
+List recent failed workflow runs with automatic failure classification:
+
+~~~~bash
+python3 tools/github-multitool/github_multitool.py runs-failed
+python3 tools/github-multitool/github_multitool.py runs-failed --limit 10
+
+# server endpoint:
+curl http://127.0.0.1:8765/runs/failed
+curl "http://127.0.0.1:8765/runs/failed?limit=10"
+~~~~
+
+Example output:
+
+~~~~json
+{
+  "ok": true,
+  "repository": "MerverliPy/calvin-opencode-system",
+  "failed_runs": [
+    {
+      "database_id": 123456,
+      "workflow_name": "Verify",
+      "status": "completed",
+      "conclusion": "failure",
+      "branch": "main",
+      "event": "push",
+      "url": "https://github.com/...",
+      "created_at": "2026-06-20T10:00:00Z",
+      "updated_at": "2026-06-20T10:05:00Z",
+      "probable_failure_class": "test failure",
+      "recommended_local_command": "tools/github-multitool/smoke-test.sh",
+      "next_debugging_step": "Inspect failed job logs with run-explain."
+    }
+  ],
+  "total_count": 1
+}
+~~~~
+
+### Explain a Failed Run
+
+Get a detailed explanation and log excerpt for a specific failed run:
+
+~~~~bash
+python3 tools/github-multitool/github_multitool.py run-explain <RUN_ID>
+python3 tools/github-multitool/github_multitool.py run-explain <RUN_ID> --log-lines 120
+
+# server endpoint:
+curl http://127.0.0.1:8765/run/<RUN_ID>/explain
+curl "http://127.0.0.1:8765/run/<RUN_ID>/explain?log_lines=120"
+~~~~
+
+Example output:
+
+~~~~json
+{
+  "ok": true,
+  "repository": "MerverliPy/calvin-opencode-system",
+  "run_id": 123456,
+  "workflow_name": "Verify",
+  "status": "completed",
+  "conclusion": "failure",
+  "probable_failure_class": "test failure",
+  "recommended_local_command": "tools/github-multitool/smoke-test.sh",
+  "next_debugging_step": "Run the matching local verification command and inspect the first failing test.",
+  "log_excerpt": "...",
+  "log_lines_returned": 80
+}
+~~~~
+
+### Failure Classes
+
+The tool automatically classifies failures using pattern matching on log output:
+
+| Class                    | Patterns Matched                                              | Recommended Local Command                  |
+|--------------------------|---------------------------------------------------------------|--------------------------------------------|
+| `shell syntax`           | "syntax error", "unexpected token", "command not found"  | `bash -n <script>`                         |
+| `test failure`           | "FAILED", "AssertionError", "pytest", "npm test"       | `tools/github-multitool/smoke-test.sh`     |
+| `dependency install`     | "npm ERR!", "pip install", "Could not resolve"           | `pip install -r requirements.txt`          |
+| `permission/token`       | "permission denied", "Bad credentials", "403", "401"   | `gh auth status`                           |
+| `workflow configuration` | "Invalid workflow file", "mapping values are not allowed"  | `yamllint .github/workflows/`              |
+| `unknown`                | No patterns matched                                           | `tools/github-multitool/smoke-test.sh`     |
+
+### Safety
+
+- Read-only: uses `gh run list`, `gh run view`, and `gh run view --log-failed`.
+- Does not rerun, cancel, or delete workflow runs.
+- Does not print tokens, credentials, or secret values.
+- Log output is redacted before display.
+- Sensitive patterns (token, secret, credential, password, cookie, authorization, bearer, GH_TOKEN, GITHUB_TOKEN) are filtered from log excerpts.
+
+
 ## Smoke Test
 
 Run the local smoke test:

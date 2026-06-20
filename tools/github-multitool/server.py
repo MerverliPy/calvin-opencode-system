@@ -178,6 +178,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200 if code == 0 else 500, payload)
             return
 
+        if path == "/runs/failed":
+            code, payload = run_cli([*base_args, "runs-failed", "--limit", limit])
+            self.send_json(200 if code == 0 else 500, payload)
+            return
+
+        if path.startswith("/run/") and path.endswith("/explain"):
+            parts = path.split("/")
+            if len(parts) < 4 or not parts[2].isdigit():
+                self.reject(400, "Run ID must be numeric.")
+                return
+            run_id = parts[2]
+            log_lines = first(query, "log_lines", "80")
+            code, payload = run_cli([*base_args, "run-explain", run_id, "--log-lines", log_lines])
+            self.send_json(200 if code == 0 else 500, payload)
+            return
+
         self.reject(404, f"Unknown endpoint: {path}")
 
 
