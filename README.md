@@ -41,3 +41,37 @@ See:
 ## Operating Rule
 
 All workflow changes should be small, reviewable, and reversible.
+
+## Daily opencode OS Workflow
+
+Generate a Termius/iPhone-safe audit upload package:
+
+~~~~bash
+./scripts/opencode-os.sh audit-prep
+~~~~
+
+Upload this generated file into ChatGPT or opencode:
+
+~~~~text
+dist/audit-requests/opencode-audit-upload.md
+~~~~
+
+Save an audit response back into the repository:
+
+~~~~bash
+./scripts/opencode-os.sh save-audit path/to/audit-response.md --commit --push
+~~~~
+
+Check repository operating-system status:
+
+~~~~bash
+./scripts/opencode-os.sh status
+~~~~
+
+Run repository verification:
+
+~~~~bash
+./scripts/verify-opencode-os.sh
+~~~~
+
+Generated `dist/` files are not committed by default.
