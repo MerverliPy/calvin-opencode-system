@@ -111,3 +111,19 @@ Use this file for durable repo-specific context.
 - Added `pr-dashboard` CLI command and `GET /prs/dashboard` server endpoint.
 - Summarizes open PRs with risk classification (draft, needs_review, changes_requested, stale, merge_conflict, blocked, unknown_merge, ready) and recommended next actions.
 - Uses `gh pr list --json` with expanded fields (mergeStateStatus, reviewDecision) and a 7-day staleness threshold.
+
+## Feature 2: PR Readiness Score
+
+- Added `pr-readiness` CLI command and `GET /pr/<number>/readiness` server endpoint.
+- Computes a numeric readiness score (0–100) from PR metadata, merge state, review decision, check status, staleness (>14 days), high-risk file patterns, and base branch.
+- Risk levels: low (85–100), medium (60–84), high (30–59), blocked (0–29).
+- Includes blockers, warnings, scoring reasons, changed files list, and recommended next action.
+
+## Feature 3: Local PR Review Pack Generator
+
+- Added `pr-review-pack` CLI command.
+- Generates a local Markdown review package under `dist/github-review-packs/pr-XXX-review-pack.md` (zero-padded 3-digit PR number).
+- Reuses existing PR readiness scoring and file-risk classification from Feature 2.
+- Uses `gh pr view --json` and `gh pr diff` (read-only backend).
+- Review pack includes: summary, readiness, changed files, compact diff, risk assessment, verification commands, rollback notes, ChatGPT/opencode review prompt, and raw metadata appendix (secrets redacted).
+- Output directory is gitignored; generated files are not staged.

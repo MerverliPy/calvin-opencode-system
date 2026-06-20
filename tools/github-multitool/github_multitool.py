@@ -388,6 +388,302 @@ def _score_pr_readiness(
     }
 
 
+
+
+def _parse_diff_stats(diff_text: str) -> dict[str, int]:
+    """Parse gh pr diff output to count files, additions, deletions."""
+    files = 0
+    additions = 0
+    deletions = 0
+    for line in diff_text.split("\n"):
+        if line.startswith("diff --git"):
+            files += 1
+        elif line.startswith("+") and not line.startswith("+++"):
+            additions += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            deletions += 1
+    return {"files": files, "additions": additions, "deletions": deletions}
+
+
+def _fetch_pr_diff(repo: str, number: int) -> str:
+    """Fetch a compact diff for a PR via gh pr diff (read-only)."""
+    result = subprocess.run(
+        ["gh", "pr", "diff", str(number), "--repo", repo, "--color", "never"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _sanitize_for_appendix(data: dict[str, Any]) -> dict[str, Any]:
+    """Remove sensitive fields from metadata for appendix inclusion."""
+    safe = dict(data)
+    sensitive_patterns = {"token", "password", "secret", "credential", "cookie", "key", "auth"}
+    for key in list(safe.keys()):
+        key_lower = key.lower()
+        for pattern in sensitive_patterns:
+            if pattern in key_lower:
+                safe[key] = "***REDACTED***"
+    return safe
+
+
+def _build_review_pack_md(
+    pr_data: dict[str, Any],
+    readiness: dict[str, Any],
+    files: list[str],
+    diff_text: str,
+    number: int,
+    padded: str,
+    repo: str,
+) -> str:
+    """Build the Markdown review pack content."""
+    lines: list[str] = []
+
+    author_data = pr_data.get("author") or {}
+    author = author_data.get("login", "unknown") if isinstance(author_data, dict) else str(author_data)
+
+    diff_stats = _parse_diff_stats(diff_text) if diff_text else {"files": 0, "additions": 0, "deletions": 0}
+
+    # ── Header ──
+    lines.append(f"# PR {number} Review Pack")
+    lines.append("")
+
+    # ── Summary ──
+    lines.append("## Summary")
+    lines.append("")
+    lines.append(f"- **Title**: {pr_data.get('title', 'N/A')}")
+    lines.append(f"- **Author**: {author}")
+    lines.append(f"- **Branch**: `{pr_data.get('headRefName', 'N/A')}` → `{pr_data.get('baseRefName', 'N/A')}`")
+    lines.append(f"- **Base Branch**: `{pr_data.get('baseRefName', 'N/A')}`")
+    lines.append(f"- **URL**: {pr_data.get('url', 'N/A')}")
+    lines.append(f"- **State**: {pr_data.get('state', 'N/A')}")
+    lines.append(f"- **Draft**: {pr_data.get('isDraft', False)}")
+    lines.append(f"- **Updated**: {pr_data.get('updatedAt', 'N/A')}")
+    lines.append("")
+
+    # ── Readiness ──
+    lines.append("## Readiness")
+    lines.append("")
+    lines.append(f"- **Score**: {readiness['score']}/100")
+    lines.append(f"- **Risk**: {readiness['risk']}")
+    blockers = readiness.get("blockers", [])
+    if blockers:
+        lines.append(f"- **Blockers**: {len(blockers)}")
+        for b in blockers:
+            lines.append(f"  - {b}")
+    else:
+        lines.append("- **Blockers**: none")
+    warnings = readiness.get("warnings", [])
+    if warnings:
+        lines.append(f"- **Warnings**: {len(warnings)}")
+        for w in warnings:
+            lines.append(f"  - {w}")
+    else:
+        lines.append("- **Warnings**: none")
+    lines.append(f"- **Recommended Next Action**: {readiness.get('recommended_next_action', 'N/A')}")
+    lines.append("")
+
+    # ── Changed Files ──
+    lines.append("## Changed Files")
+    lines.append("")
+    if files:
+        for fp in files:
+            flag = "  ⚠️ HIGH RISK" if _is_high_risk_file(fp) else ""
+            lines.append(f"- `{fp}`{flag}")
+    else:
+        lines.append("_No changed files available._")
+    lines.append("")
+
+    # ── Diff Summary ──
+    lines.append("## Diff Summary")
+    lines.append("")
+    if diff_text:
+        lines.append(f"- **Files changed**: {diff_stats['files']}")
+        lines.append(f"- **Additions**: {diff_stats['additions']}")
+        lines.append(f"- **Deletions**: {diff_stats['deletions']}")
+        lines.append("")
+        lines.append("```diff")
+        diff_lines = diff_text.split("\n")
+        max_diff = 150
+        if len(diff_lines) <= max_diff:
+            lines.append(diff_text)
+        else:
+            lines.append("\n".join(diff_lines[:max_diff]))
+            lines.append(f"")
+            lines.append(f"... ({len(diff_lines) - max_diff} more lines truncated)")
+        lines.append("```")
+    else:
+        lines.append("_Diff not available._")
+    lines.append("")
+
+    # ── Risk Assessment ──
+    lines.append("## Risk Assessment")
+    lines.append("")
+    high_risk_files = [fp for fp in files if _is_high_risk_file(fp)]
+    if readiness["risk"] == "low":
+        lines.append("This PR appears low-risk. No significant blockers or high-risk file changes detected.")
+    elif readiness["risk"] == "medium":
+        lines.append("This PR has moderate risk. Review the warnings below and verify changed files before merging.")
+    elif readiness["risk"] == "high":
+        lines.append("**⚠️ This PR has high risk.** Review carefully before merging.")
+    else:
+        lines.append("**🚫 This PR is blocked.** Address blockers before any review or merge attempt.")
+    lines.append("")
+
+    if high_risk_files:
+        lines.append("### High-Risk Files Changed")
+        lines.append("")
+        lines.append("The following files match high-risk patterns and deserve extra scrutiny:")
+        lines.append("")
+        for f in high_risk_files:
+            lines.append(f"- `{f}`")
+        lines.append("")
+
+    # Specific risk notes based on signals
+    scoring = readiness.get("scoring_reasons", [])
+    negative_signals = [s for s in scoring if s.get("effect", 0) < 0]
+    if negative_signals:
+        lines.append("### Risk Signals")
+        lines.append("")
+        for s in negative_signals:
+            lines.append(f"- **{s.get('signal', 'unknown')}** (effect: {s.get('effect', 0)}): {s.get('detail', '')}")
+        lines.append("")
+
+    lines.append("")
+
+    # ── Verification Commands ──
+    lines.append("## Verification Commands")
+    lines.append("")
+    lines.append("Run the following commands to verify the repository state:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append("tools/github-multitool/smoke-test.sh")
+    lines.append("./scripts/verify-opencode-os.sh")
+    lines.append("git status --short --branch")
+    lines.append("```")
+    lines.append("")
+
+    # ── Rollback Notes ──
+    lines.append("## Rollback Notes")
+    lines.append("")
+    head_branch = pr_data.get("headRefName", "feature-branch")
+    base_branch = pr_data.get("baseRefName", "main")
+    lines.append("To abandon this branch locally before merge:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append(f"git checkout {base_branch}")
+    lines.append(f"git branch -D {head_branch}")
+    lines.append("```")
+    lines.append("")
+    lines.append("If the PR has already been merged and needs reversion:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append("git revert <merge-commit-hash>")
+    lines.append("```")
+    lines.append("")
+
+    # ── ChatGPT / opencode Review Prompt ──
+    lines.append("## ChatGPT / opencode Review Prompt")
+    lines.append("")
+    lines.append("Copy and paste the following prompt into ChatGPT, opencode, or another review tool:")
+    lines.append("")
+    lines.append("```")
+    lines.append(f"Please review PR #{number} ({pr_data.get('title', 'N/A')}) in the {repo} repository.")
+    lines.append("")
+    lines.append("Review checklist:")
+    lines.append("1. **Correctness** — Does the logic accomplish the intended goal without bugs or unintended side effects?")
+    lines.append("2. **Safety** — Are there security risks, token leaks, injection vectors, or unsafe command patterns?")
+    lines.append("3. **Regression risk** — Could this change break existing features, workflows, or smoke tests?")
+    lines.append("4. **Missing verification** — What tests, assertions, or manual checks should be added?")
+    lines.append("5. **Suggested improvements** — What could be simpler, cleaner, or more maintainable?")
+    lines.append("")
+    lines.append("The diff summary and changed files are included in this review pack.")
+    lines.append("Focus on the risk assessment signals first.")
+    lines.append("```")
+    lines.append("")
+
+    # ── Raw Metadata Appendix ──
+    lines.append("## Raw Metadata Appendix")
+    lines.append("")
+    lines.append("```json")
+    appendix = {
+        "pr_metadata": _sanitize_for_appendix(pr_data),
+        "readiness": {
+            "score": readiness["score"],
+            "risk": readiness["risk"],
+            "blockers": readiness.get("blockers", []),
+            "warnings": readiness.get("warnings", []),
+            "recommended_next_action": readiness.get("recommended_next_action"),
+        },
+        "changed_files": files,
+        "diff_stats": diff_stats,
+        "high_risk_files": high_risk_files,
+    }
+    lines.append(json.dumps(appendix, indent=2, sort_keys=True))
+    lines.append("```")
+    lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# ── CLI command: pr-review-pack ─────────────────────────────────────────────
+
+
+def cmd_pr_review_pack(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Generate a local Markdown review package for a PR."""
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+    number: int = args.number
+
+    # Fetch PR metadata (required)
+    try:
+        pr_data = _fetch_pr_metadata(repo, number)
+    except ToolError as exc:
+        print_json({"ok": False, "error": f"Failed to fetch PR metadata: {exc}"})
+        return 2
+
+    # Fetch changed files (best-effort)
+    try:
+        files = _fetch_changed_files(repo, number)
+    except ToolError as exc:
+        files = []
+
+    # Fetch checks (best-effort)
+    try:
+        checks = _fetch_pr_checks(repo, number)
+    except ToolError as exc:
+        checks = []
+
+    # Compute readiness score
+    readiness = _score_pr_readiness(pr_data, files, checks)
+
+    # Fetch compact diff (read-only, best-effort)
+    diff_text = _fetch_pr_diff(repo, number)
+
+    # Generate output path
+    output_dir = repo_root() / "dist" / "github-review-packs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    padded = f"{number:03d}"
+    output_path = output_dir / f"pr-{padded}-review-pack.md"
+
+    # Build and write Markdown review pack
+    md_content = _build_review_pack_md(pr_data, readiness, files, diff_text, number, padded, repo)
+    output_path.write_text(md_content, encoding="utf-8")
+
+    # Print JSON result
+    result = {
+        "ok": True,
+        "pr_number": number,
+        "output_path": str(output_path),
+        "repository": repo,
+        "readiness_score": readiness["score"],
+        "risk": readiness["risk"],
+        "changed_file_count": len(files),
+    }
+    print_json(result)
+    return 0
+
 # ---------------------------------------------------------------------------
 # CLI commands
 # ---------------------------------------------------------------------------
@@ -723,6 +1019,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("pr-readiness", help="Compute a PR readiness score.")
     p.add_argument("number", type=int)
     p.set_defaults(func=cmd_pr_readiness)
+
+    p = sub.add_parser("pr-review-pack", help="Generate a local Markdown review pack for a PR.")
+    p.add_argument("number", type=int)
+    p.set_defaults(func=cmd_pr_review_pack)
 
     p = sub.add_parser("issues-list", help="List issues.")
     p.add_argument("--state", choices=["open", "closed", "all"], default="open")

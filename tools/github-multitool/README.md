@@ -204,6 +204,67 @@ The following patterns are considered high-risk:
 - `Dockerfile`, `docker-compose.yml`
 - Paths containing: `secret`, `token`, `credential`, `auth`, `deploy`, `release`, `workflow`
 
+
+### PR Review Pack Generator
+
+Generate a local Markdown review package for a pull request that can be
+handed to ChatGPT, opencode, or a manual reviewer:
+
+~~~~bash
+python3 tools/github-multitool/github_multitool.py pr-review-pack <PR_NUMBER>
+~~~~
+
+Example:
+
+~~~~bash
+python3 tools/github-multitool/github_multitool.py pr-review-pack 4
+~~~~
+
+Example output:
+
+~~~~json
+{
+  "ok": true,
+  "pr_number": 4,
+  "output_path": "/home/calvin/calvin-opencode-system/dist/github-review-packs/pr-004-review-pack.md",
+  "repository": "MerverliPy/calvin-opencode-system",
+  "readiness_score": 86,
+  "risk": "low",
+  "changed_file_count": 3
+}
+~~~~
+
+Generated files follow zero-padded 3-digit naming:
+- PR 4 → `pr-004-review-pack.md`
+- PR 27 → `pr-027-review-pack.md`
+- PR 142 → `pr-142-review-pack.md`
+
+#### Review Pack Structure
+
+Each generated Markdown file contains:
+
+| Section                   | Contents                                                        |
+|---------------------------|-----------------------------------------------------------------|
+| Summary                   | Title, author, branch, base branch, URL, state, draft, updated  |
+| Readiness                 | Score, risk, blockers, warnings, recommended next action        |
+| Changed Files             | File list with high-risk path flags                             |
+| Diff Summary              | Compact diff stats and truncated diff (capped at 150 lines)     |
+| Risk Assessment           | Risk-level explanation and risk signals breakdown               |
+| Verification Commands     | Smoke test, verify-opencode-os.sh, git status commands          |
+| Rollback Notes            | Commands to abandon or revert the branch safely                 |
+| ChatGPT / opencode Prompt | Reusable review prompt with correctness, safety, and regression |
+| Raw Metadata Appendix     | Compact JSON metadata (secrets redacted)                        |
+
+Output files are written to `dist/github-review-packs/` which is gitignored.
+
+#### Safety
+
+- Read-only: uses `gh pr view` and `gh pr diff` only.
+- Does not create, edit, merge, close, or delete PRs.
+- Does not print tokens, credentials, or secret values.
+- Metadata appendix redacts sensitive-looking keys.
+
+
 ## Smoke Test
 
 Run the local smoke test:
