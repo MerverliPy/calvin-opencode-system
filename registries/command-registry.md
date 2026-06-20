@@ -16,3 +16,4 @@ This registry tracks reusable opencode commands.
 | model-router | `.opencode/commands/model-router.md` | Choose the best local or cloud model route for a task. | Active |
 | sandbox-start | `.opencode/commands/sandbox-start.md` | Choose and start the right sandbox level. | Active |
 | memory-update | `.opencode/commands/memory-update.md` | Update durable project memory safely. | Active |
+| github-multitool | `.opencode/commands/github-multitool.md` | Operate the local GitHub multitool safely. | Active |
