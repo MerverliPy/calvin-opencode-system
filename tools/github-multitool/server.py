@@ -10,6 +10,7 @@ Read-only MVP endpoints:
 - GET /branches
 - GET /runs
 - GET /pr/<number>
+- GET /pr/<number>/readiness
 
 Security model:
 - Binds only to localhost / 127.0.0.1.
@@ -140,6 +141,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/prs":
             code, payload = run_cli([*base_args, "prs-list", "--state", state, "--limit", limit])
+            self.send_json(200 if code == 0 else 500, payload)
+            return
+
+        # PR readiness must be checked before the generic /pr/<number> handler
+        if path.startswith("/pr/") and path.endswith("/readiness"):
+            parts = path.split("/")
+            if len(parts) < 4 or not parts[2].isdigit():
+                self.reject(400, "PR number must be numeric.")
+                return
+            code, payload = run_cli([*base_args, "pr-readiness", parts[2]])
             self.send_json(200 if code == 0 else 500, payload)
             return
 

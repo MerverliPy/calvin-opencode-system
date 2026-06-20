@@ -122,6 +122,76 @@ check_endpoint "Server PR dashboard" "http://127.0.0.1:8765/prs/dashboard?limit=
 check_endpoint "Server issues list" "http://127.0.0.1:8765/issues?limit=5" "/tmp/github-multitool-server-issues.json"
 check_endpoint "Server branches list" "http://127.0.0.1:8765/branches?limit=5" "/tmp/github-multitool-server-branches.json"
 
+# ── PR readiness (CLI) ──────────────────────────────────────────
+echo
+echo "== CLI pr-readiness =="
+# Find an open PR number, or skip with a safe fallback
+PR_NUMBER="$(python3 -c "
+import json
+with open('/tmp/github-multitool-server-prs.json') as f:
+    prs = json.load(f)
+if isinstance(prs, list) and prs:
+    print(prs[0].get('number', ''))
+" 2>/dev/null || echo "")"
+
+if [[ -n "$PR_NUMBER" ]]; then
+  python3 tools/github-multitool/github_multitool.py pr-readiness "$PR_NUMBER" > /tmp/github-multitool-cli-pr-readiness.json
+  cat /tmp/github-multitool-cli-pr-readiness.json
+
+  # Quick validation: output must have score and risk fields
+  score="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cli-pr-readiness.json') as f:
+    d = json.load(f)
+print(d.get('score', ''))
+")"
+  risk="$(python3 -c "
+import json
+with open('/tmp/github-multitool-cli-pr-readiness.json') as f:
+    d = json.load(f)
+print(d.get('risk', ''))
+")"
+  if [[ -z "$score" || -z "$risk" ]]; then
+    echo "[FAIL] CLI pr-readiness missing score or risk field"
+    exit 1
+  fi
+  echo
+  echo "[PASS] CLI pr-readiness (PR #$PR_NUMBER, score=$score, risk=$risk)"
+else
+  echo "No open PRs found; skipping CLI pr-readiness test."
+  echo "[PASS] CLI pr-readiness (skipped — no open PRs)"
+fi
+
+# ── PR readiness (server endpoint) ──────────────────────────────
+echo
+echo "== Server pr-readiness =="
+if [[ -n "$PR_NUMBER" ]]; then
+  curl -fsS "http://127.0.0.1:8765/pr/$PR_NUMBER/readiness" > /tmp/github-multitool-server-pr-readiness.json
+  cat /tmp/github-multitool-server-pr-readiness.json
+
+  score="$(python3 -c "
+import json
+with open('/tmp/github-multitool-server-pr-readiness.json') as f:
+    d = json.load(f)
+print(d.get('score', ''))
+")"
+  risk="$(python3 -c "
+import json
+with open('/tmp/github-multitool-server-pr-readiness.json') as f:
+    d = json.load(f)
+print(d.get('risk', ''))
+")"
+  if [[ -z "$score" || -z "$risk" ]]; then
+    echo "[FAIL] Server pr-readiness missing score or risk field"
+    exit 1
+  fi
+  echo
+  echo "[PASS] Server pr-readiness (PR #$PR_NUMBER, score=$score, risk=$risk)"
+else
+  echo "No open PRs found; skipping server pr-readiness test."
+  echo "[PASS] Server pr-readiness (skipped — no open PRs)"
+fi
+
 echo
 echo "== Server strict-private route behavior =="
 strict_status="$(

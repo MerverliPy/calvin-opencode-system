@@ -18,9 +18,9 @@ import json
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
-from datetime import datetime, timezone, timedelta
 
 from config_validation import ConfigError, repo_visibility_warnings, validate_config
 
@@ -119,6 +119,280 @@ def run_gh_json(args: list[str]) -> Any:
         raise ToolError(f"Expected JSON from gh, got non-JSON output: {exc}") from exc
 
 
+# ---------------------------------------------------------------------------
+# PR Readiness Score helpers
+# ---------------------------------------------------------------------------
+
+HIGH_RISK_DIRS = [
+    ".github/workflows/",
+    "tools/github-multitool/",
+    "scripts/",
+    ".opencode/",
+]
+
+HIGH_RISK_FILES = {
+    "package-lock.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "dockerfile",
+    "docker-compose.yml",
+}
+
+HIGH_RISK_KEYWORDS = [
+    "secret", "token", "credential", "auth",
+    "deploy", "release", "workflow",
+]
+
+STALE_DAYS = 14
+
+
+def _is_high_risk_file(filepath: str) -> bool:
+    """Return True if *filepath* matches high-risk directory, file, or keyword."""
+    path_lower = filepath.lower()
+
+    for d in HIGH_RISK_DIRS:
+        if path_lower.startswith(d):
+            return True
+
+    filename = path_lower.split("/")[-1]
+    if filename in HIGH_RISK_FILES:
+        return True
+
+    for kw in HIGH_RISK_KEYWORDS:
+        if kw in path_lower:
+            return True
+
+    return False
+
+
+def _fetch_pr_metadata(repo: str, number: int) -> dict[str, Any]:
+    """Fetch PR metadata via gh pr view --json."""
+    return run_gh_json([
+        "pr", "view", str(number),
+        "--repo", repo,
+        "--json",
+        "number,title,state,isDraft,author,headRefName,baseRefName,"
+        "mergeStateStatus,reviewDecision,url,updatedAt,createdAt",
+    ])
+
+
+def _fetch_changed_files(repo: str, number: int) -> list[str]:
+    """Fetch changed file paths for a PR via gh pr view --json files."""
+    try:
+        result = run_gh_json([
+            "pr", "view", str(number),
+            "--repo", repo,
+            "--json", "files",
+        ])
+    except ToolError:
+        return []
+
+    files = result.get("files") if isinstance(result, dict) else result
+    if not isinstance(files, list):
+        return []
+    return [f.get("path", "") for f in files if isinstance(f, dict)]
+
+
+def _fetch_pr_checks(repo: str, number: int) -> list[dict[str, Any]]:
+    """Fetch PR check statuses via gh pr checks --json."""
+    try:
+        result = run_gh_json([
+            "pr", "checks", str(number),
+            "--repo", repo,
+            "--json", "name,status,conclusion",
+        ])
+    except ToolError:
+        return []
+    return result if isinstance(result, list) else []
+
+
+def _score_pr_readiness(
+    pr_data: dict[str, Any],
+    files: list[str],
+    checks_data: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compute a numeric readiness score (0-100) and risk level."""
+
+    score: int = 100
+    blockers: list[str] = []
+    warnings: list[str] = []
+    reasons: list[dict[str, Any]] = []
+
+    number = pr_data.get("number")
+
+    # ── Merge state ───────────────────────────────────────────────
+    mss = (pr_data.get("mergeStateStatus") or "").upper()
+    if mss == "CLEAN":
+        reasons.append({"signal": "merge_state_clean", "effect": 0,
+                        "detail": "Merge state is clean"})
+    elif mss == "DIRTY":
+        score -= 30
+        blockers.append("Merge conflicts detected")
+        reasons.append({"signal": "merge_state_dirty", "effect": -30,
+                        "detail": "Merge state is dirty (conflicts)"})
+    elif mss == "BLOCKED":
+        score -= 30
+        blockers.append("Merge is blocked")
+        reasons.append({"signal": "merge_state_blocked", "effect": -30,
+                        "detail": "Merge is blocked"})
+    elif mss in ("UNKNOWN", ""):
+        score -= 10
+        warnings.append("Merge state is unknown")
+        reasons.append({"signal": "merge_state_unknown", "effect": -10,
+                        "detail": "Merge state is unknown"})
+    else:
+        score -= 10
+        warnings.append(f"Unexpected merge state: {mss}")
+        reasons.append({"signal": "merge_state_unexpected", "effect": -10,
+                        "detail": f"Unexpected merge state: {mss}"})
+
+    # ── Draft ─────────────────────────────────────────────────────
+    if pr_data.get("isDraft"):
+        score -= 30
+        blockers.append("PR is a draft")
+        reasons.append({"signal": "draft", "effect": -30,
+                        "detail": "Draft PRs are not ready for review"})
+    else:
+        reasons.append({"signal": "not_draft", "effect": 0,
+                        "detail": "PR is not a draft"})
+
+    # ── Stale ─────────────────────────────────────────────────────
+    updated_at = pr_data.get("updatedAt", "")
+    if updated_at:
+        try:
+            updated_dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - updated_dt).days
+            if age_days > STALE_DAYS:
+                score -= 10
+                warnings.append(f"PR is stale ({age_days} days since last update)")
+                reasons.append({"signal": "stale_pr", "effect": -10,
+                                "detail": f"PR has not been updated in {age_days} days"})
+        except (ValueError, TypeError):
+            pass
+
+    # ── Review decision ───────────────────────────────────────────
+    rd = (pr_data.get("reviewDecision") or "").upper()
+    if rd == "APPROVED":
+        reasons.append({"signal": "review_approved", "effect": 0,
+                        "detail": "Review has been approved"})
+    elif rd == "CHANGES_REQUESTED":
+        score -= 15
+        blockers.append("Changes requested in review")
+        reasons.append({"signal": "review_changes_requested", "effect": -15,
+                        "detail": "Review requested changes"})
+    elif rd in ("REVIEW_REQUIRED", ""):
+        score -= 5
+        warnings.append("Review decision unavailable")
+        reasons.append({"signal": "review_unavailable", "effect": -5,
+                        "detail": "Review decision is not available"})
+    else:
+        score -= 5
+        warnings.append(f"Unknown review decision: {rd}")
+        reasons.append({"signal": "review_unknown", "effect": -5,
+                        "detail": f"Unknown review decision: {rd}"})
+
+    # ── Base branch ───────────────────────────────────────────────
+    base_ref = pr_data.get("baseRefName", "")
+    if base_ref == "main":
+        reasons.append({"signal": "base_is_main", "effect": 0,
+                        "detail": "Base branch is main"})
+    else:
+        score -= 5
+        warnings.append(f"Base branch is '{base_ref}', not main")
+        reasons.append({"signal": "base_not_main", "effect": -5,
+                        "detail": f"Base branch is '{base_ref}', not main"})
+
+    # ── Checks ────────────────────────────────────────────────────
+    if checks_data:
+        failed = [c for c in checks_data if c.get("conclusion") == "FAILURE"]
+        pending = [c for c in checks_data
+                   if c.get("status") in ("IN_PROGRESS", "QUEUED")]
+
+        if failed:
+            score -= max(20, len(failed) * 5)  # significant penalty
+            blockers.append(f"{len(failed)} check(s) failed")
+            reasons.append({"signal": "checks_failed",
+                            "effect": -max(20, len(failed) * 5),
+                            "detail": f"{len(failed)} checks failed",
+                            "failed_checks": [c.get("name") for c in failed]})
+        elif pending:
+            score -= 5
+            warnings.append(f"{len(pending)} check(s) still running")
+            reasons.append({"signal": "checks_pending", "effect": -5,
+                            "detail": f"{len(pending)} checks pending"})
+        else:
+            reasons.append({"signal": "checks_passed", "effect": 0,
+                            "detail": "All checks passed or neutral"})
+    else:
+        score -= 5
+        warnings.append("Check status unavailable")
+        reasons.append({"signal": "checks_unavailable", "effect": -5,
+                        "detail": "Check status could not be fetched"})
+
+    # ── High-risk files ───────────────────────────────────────────
+    if files:
+        risky = [f for f in files if _is_high_risk_file(f)]
+        if risky:
+            # cap combined file-risk deduction at 30
+            risk_deduction = min(30, len(risky) * 10)
+            score -= risk_deduction
+            if risk_deduction >= 20:
+                blockers.append(f"{len(risky)} high-risk file(s) changed")
+            else:
+                warnings.append(f"{len(risky)} high-risk file(s) changed")
+            reasons.append({
+                "signal": "high_risk_files",
+                "effect": -risk_deduction,
+                "detail": f"{len(risky)} high-risk files changed",
+                "files": risky,
+            })
+        else:
+            reasons.append({"signal": "no_risky_files", "effect": 0,
+                            "detail": "No high-risk files changed"})
+    else:
+        warnings.append("Changed files unavailable")
+        reasons.append({"signal": "files_unavailable", "effect": 0,
+                        "detail": "Changed files could not be fetched"})
+
+    # ── Clamp & risk level ────────────────────────────────────────
+    score = max(0, min(100, score))
+
+    if score >= 85:
+        risk = "low"
+    elif score >= 60:
+        risk = "medium"
+    elif score >= 30:
+        risk = "high"
+    else:
+        risk = "blocked"
+
+    # ── Recommended next action ───────────────────────────────────
+    if blockers:
+        recommended = "Address blockers before proceeding."
+    elif warnings:
+        recommended = "Run local verification and request review."
+    elif score >= 85:
+        recommended = "PR appears ready to merge."
+    else:
+        recommended = "Review and address warnings before proceeding."
+
+    return {
+        "number": number,
+        "score": score,
+        "risk": risk,
+        "blockers": blockers,
+        "warnings": warnings,
+        "scoring_reasons": reasons,
+        "changed_files": files,
+        "recommended_next_action": recommended,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI commands
+# ---------------------------------------------------------------------------
+
+
 def cmd_health(config: dict[str, Any], args: argparse.Namespace) -> int:
     payload = {
         "ok": True,
@@ -189,7 +463,6 @@ def cmd_pr_view(config: dict[str, Any], args: argparse.Namespace) -> int:
     ])
     print_json(payload)
     return 0
-
 
 
 def cmd_pr_dashboard(config: dict[str, Any], args: argparse.Namespace) -> int:
@@ -325,6 +598,43 @@ def _build_dashboard_summary(prs: list[dict[str, Any]]) -> dict[str, int]:
                 summary[level] += 1
     return summary
 
+
+def cmd_pr_readiness(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Compute a PR readiness score from metadata, checks, and changed files."""
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+    number: int = args.number
+    fetch_errors: list[str] = []
+
+    # Fetch PR metadata (required)
+    try:
+        pr_data = _fetch_pr_metadata(repo, number)
+    except ToolError as exc:
+        print_json({"ok": False, "error": f"Failed to fetch PR metadata: {exc}"})
+        return 2
+
+    # Fetch changed files (best-effort)
+    try:
+        files = _fetch_changed_files(repo, number)
+    except ToolError as exc:
+        files = []
+        fetch_errors.append(f"Changed files unavailable: {exc}")
+
+    # Fetch checks (best-effort)
+    try:
+        checks = _fetch_pr_checks(repo, number)
+    except ToolError as exc:
+        checks = []
+        fetch_errors.append(f"Checks unavailable: {exc}")
+
+    result = _score_pr_readiness(pr_data, files, checks)
+    if fetch_errors:
+        result["fetch_errors"] = fetch_errors
+    result["ok"] = True
+    print_json(result)
+    return 0
+
+
 def cmd_issues_list(config: dict[str, Any], args: argparse.Namespace) -> int:
     repo = resolve_repo(config, args.repo)
     payload = run_gh_json([
@@ -409,6 +719,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("pr-dashboard", help="PR intelligence dashboard with risk analysis.")
     p.add_argument("--limit", type=int, default=50, help="Max PRs to analyze (default: 50).")
     p.set_defaults(func=cmd_pr_dashboard)
+
+    p = sub.add_parser("pr-readiness", help="Compute a PR readiness score.")
+    p.add_argument("number", type=int)
+    p.set_defaults(func=cmd_pr_readiness)
 
     p = sub.add_parser("issues-list", help="List issues.")
     p.add_argument("--state", choices=["open", "closed", "all"], default="open")
