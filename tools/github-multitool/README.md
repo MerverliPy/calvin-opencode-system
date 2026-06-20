@@ -96,5 +96,13 @@ The smoke test checks:
 
 - Python syntax
 - CLI health
-- localhost server health
-- read-only repo status endpoint
+- CLI repo status
+- strict-private behavior
+- localhost server startup
+- server health endpoint
+- server repo status endpoint
+- server PR list endpoint
+- server issues list endpoint
+- server branches list endpoint
+- server strict-private route behavior
+- rejection of write HTTP methods

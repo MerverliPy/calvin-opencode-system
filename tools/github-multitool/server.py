@@ -27,6 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from config_validation import ConfigError, validate_config
+
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools/github-multitool/github_multitool.py"
@@ -47,7 +49,7 @@ def load_config() -> dict:
                 config.update(json.load(f))
             break
 
-    return config
+    return validate_config(config)
 
 
 def run_cli(args: list[str]) -> tuple[int, dict | list | str]:
@@ -123,7 +125,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/repo/status":
-            code, payload = run_cli([*base_args, "repo-status"])
+            cli_args = [*base_args, "repo-status"]
+            strict_private = first(query, "strict_private", "0")
+            if str(strict_private).lower() in {"1", "true", "yes"}:
+                cli_args.append("--strict-private")
+            code, payload = run_cli(cli_args)
             self.send_json(200 if code == 0 else 500, payload)
             return
 
@@ -160,7 +166,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    config = load_config()
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
+        return 2
+
     host = str(config.get("host", "127.0.0.1"))
     port = int(config.get("port", 8765))
 

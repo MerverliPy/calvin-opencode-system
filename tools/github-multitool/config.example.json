@@ -20,5 +20,7 @@
     "show-credential",
     "bind-public",
     "exfiltrate-secret"
-  ]
+  ],
+  "warn_public_repositories": true,
+  "strict_private": false
 }
