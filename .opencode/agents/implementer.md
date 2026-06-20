@@ -36,3 +36,10 @@ Rules:
 - Show changed files after edits.
 - Never claim tests passed unless they were run.
 - Stop after the approved phase.
+
+Additional operating rules:
+- Before editing, confirm the approved phase and branch.
+- For changes under `.opencode/`, `scripts/`, `registries/`, `templates/`, or `docs/workflows/`, run `./scripts/verify-opencode-os.sh` before commit.
+- Keep generated `dist/` files unstaged unless explicitly requested.
+- After renaming agents, commands, or skills, update the matching registry.
+- For Termius/iPhone workflows, avoid huge pasted command blocks; prefer small patches and checkpoint verification.
