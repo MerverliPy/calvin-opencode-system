@@ -62,3 +62,24 @@ The tool should:
 ## Status
 
 Current status: design phase.
+
+## Localhost Server
+
+Start the read-only localhost server:
+
+~~~~bash
+python3 tools/github-multitool/server.py
+~~~~
+
+Example local requests:
+
+~~~~bash
+curl http://127.0.0.1:8765/health
+curl http://127.0.0.1:8765/repo/status
+curl http://127.0.0.1:8765/prs
+curl http://127.0.0.1:8765/issues
+curl http://127.0.0.1:8765/branches
+curl http://127.0.0.1:8765/runs
+~~~~
+
+The MVP server intentionally rejects POST, PUT, and DELETE requests.
