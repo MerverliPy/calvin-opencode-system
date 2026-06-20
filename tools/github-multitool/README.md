@@ -33,6 +33,7 @@ health
 repo-status
 prs-list
 pr-view
+pr-dashboard
 issues-list
 branches-list
 runs-list
@@ -80,9 +81,48 @@ curl http://127.0.0.1:8765/prs
 curl http://127.0.0.1:8765/issues
 curl http://127.0.0.1:8765/branches
 curl http://127.0.0.1:8765/runs
+curl http://127.0.0.1:8765/prs/dashboard
 ~~~~
 
 The MVP server intentionally rejects POST, PUT, and DELETE requests.
+
+## PR Intelligence Dashboard
+
+Generate a read-only dashboard that summarizes open pull requests with risk
+classification and recommended next actions:
+
+~~~~bash
+python3 tools/github-multitool/github_multitool.py pr-dashboard          # all open PRs, up to 50
+python3 tools/github-multitool/github_multitool.py pr-dashboard --limit 10
+
+# server endpoint:
+curl http://127.0.0.1:8765/prs/dashboard
+curl "http://127.0.0.1:8765/prs/dashboard?limit=10"
+~~~~
+
+The dashboard uses `gh pr list` and returns a JSON payload with:
+
+- **prs**: normalized PR objects (number, title, state, draft, author,
+  branches, timestamps, URL, merge state, review decision).
+- **risk_levels**: per-PR risk tags — `draft`, `needs_review`,
+  `changes_requested`, `stale`, `merge_conflict`, `blocked`,
+  `unknown_merge`, or `ready`.
+- **recommended_action**: a human-readable string suggesting the next step.
+- **summary**: aggregate counts of each risk level across all open PRs.
+
+### Risk Classifier Rules
+
+| Condition                 | Risk Level          | Recommended Action                       |
+|---------------------------|---------------------|------------------------------------------|
+| Draft PR                  | `draft`             | Complete draft before requesting review  |
+| No review decision        | `needs_review`      | Request or await review                  |
+| Changes requested         | `changes_requested` | Address requested changes                |
+| Review required           | `needs_review`      | Await review completion                  |
+| Unknown merge state       | `unknown_merge`     | Check CI status and merge conflicts      |
+| Dirty merge state         | `merge_conflict`    | Resolve merge conflicts                  |
+| Blocked merge state       | `blocked`           | Unblock merge requirements               |
+| Not updated in 7+ days    | `stale`             | Follow up or consider closing stale PR   |
+| No risks detected         | `ready`             | Ready to merge                           |
 
 ## Smoke Test
 

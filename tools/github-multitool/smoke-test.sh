@@ -93,6 +93,14 @@ else
 fi
 
 echo
+
+echo
+echo "== CLI pr-dashboard =="
+python3 tools/github-multitool/github_multitool.py pr-dashboard --limit 5 > /tmp/github-multitool-cli-dashboard.json
+cat /tmp/github-multitool-cli-dashboard.json
+echo
+echo "[PASS] CLI pr-dashboard"
+
 echo "== Server startup =="
 python3 tools/github-multitool/server.py > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
@@ -110,6 +118,7 @@ echo "[PASS] Server process started"
 check_endpoint "Server health" "http://127.0.0.1:8765/health" "/tmp/github-multitool-server-health.json"
 check_endpoint "Server repo status" "http://127.0.0.1:8765/repo/status" "/tmp/github-multitool-server-repo-status.json"
 check_endpoint "Server PR list" "http://127.0.0.1:8765/prs?limit=5" "/tmp/github-multitool-server-prs.json"
+check_endpoint "Server PR dashboard" "http://127.0.0.1:8765/prs/dashboard?limit=5" "/tmp/github-multitool-server-dashboard.json"
 check_endpoint "Server issues list" "http://127.0.0.1:8765/issues?limit=5" "/tmp/github-multitool-server-issues.json"
 check_endpoint "Server branches list" "http://127.0.0.1:8765/branches?limit=5" "/tmp/github-multitool-server-branches.json"
 

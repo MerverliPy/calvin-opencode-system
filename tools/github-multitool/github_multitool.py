@@ -20,6 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from datetime import datetime, timezone, timedelta
 
 from config_validation import ConfigError, repo_visibility_warnings, validate_config
 
@@ -190,6 +191,140 @@ def cmd_pr_view(config: dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_pr_dashboard(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """PR Intelligence Dashboard: summarize open PRs with risk and action data."""
+    repo = resolve_repo(config, args.repo)
+    raw_prs = run_gh_json([
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "open",
+        "--limit",
+        str(args.limit),
+        "--json",
+        "number,title,state,isDraft,author,headRefName,baseRefName,updatedAt,url,mergeStateStatus,reviewDecision,createdAt",
+    ])
+
+    if not isinstance(raw_prs, list):
+        raw_prs = []
+
+    normalized = []
+    for pr in raw_prs:
+        entry = _normalize_pr(pr)
+        risk_levels, recommended_action = _classify_pr_risk(entry)
+        entry["risk_levels"] = risk_levels
+        entry["recommended_action"] = recommended_action
+        normalized.append(entry)
+
+    summary = _build_dashboard_summary(normalized)
+
+    output = {
+        "ok": True,
+        "repository": repo,
+        "total_count": len(normalized),
+        "summary": summary,
+        "prs": normalized,
+    }
+    print_json(output)
+    return 0
+
+
+def _normalize_pr(pr: dict[str, Any]) -> dict[str, Any]:
+    """Normalize gh PR output into a stable internal schema."""
+    author_info = pr.get("author") or {}
+    return {
+        "number": pr.get("number"),
+        "title": pr.get("title"),
+        "state": pr.get("state"),
+        "is_draft": bool(pr.get("isDraft")),
+        "author": author_info.get("login") if isinstance(author_info, dict) else str(author_info),
+        "head_branch": pr.get("headRefName"),
+        "base_branch": pr.get("baseRefName"),
+        "updated_at": pr.get("updatedAt"),
+        "created_at": pr.get("createdAt"),
+        "url": pr.get("url"),
+        "merge_state": pr.get("mergeStateStatus"),
+        "review_decision": pr.get("reviewDecision"),
+    }
+
+
+def _classify_pr_risk(pr: dict[str, Any]) -> tuple[list[str], str]:
+    """Classify a PR into risk levels and recommend a next action."""
+    risk_levels: list[str] = []
+    actions: list[str] = []
+
+    # Draft PRs are low readiness
+    if pr.get("is_draft"):
+        risk_levels.append("draft")
+        actions.append("Complete draft before requesting review")
+
+    # Review decision analysis
+    review = pr.get("review_decision", "") or ""
+    if review == "":
+        risk_levels.append("needs_review")
+        actions.append("Request or await review")
+    elif review == "CHANGES_REQUESTED":
+        risk_levels.append("changes_requested")
+        actions.append("Address requested changes")
+    elif review == "REVIEW_REQUIRED":
+        risk_levels.append("needs_review")
+        actions.append("Await review completion")
+
+    # Merge state analysis
+    merge = pr.get("merge_state", "") or ""
+    if merge == "UNKNOWN" or merge == "":
+        risk_levels.append("unknown_merge")
+        actions.append("Check CI status and merge conflicts")
+    elif merge == "DIRTY":
+        risk_levels.append("merge_conflict")
+        actions.append("Resolve merge conflicts")
+    elif merge == "BLOCKED":
+        risk_levels.append("blocked")
+        actions.append("Unblock merge requirements")
+
+    # Staleness check (not updated in > 7 days)
+    updated = pr.get("updated_at", "") or ""
+    if updated:
+        try:
+            updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            if (now - updated_dt) > timedelta(days=7):
+                risk_levels.append("stale")
+                actions.append("Follow up or consider closing stale PR")
+        except (ValueError, TypeError):
+            pass
+
+    # If no risks identified, the PR appears ready
+    if not risk_levels:
+        risk_levels.append("ready")
+        actions.append("Ready to merge")
+
+    recommended_action = "; ".join(actions) if actions else "Review manually"
+    return risk_levels, recommended_action
+
+
+def _build_dashboard_summary(prs: list[dict[str, Any]]) -> dict[str, int]:
+    """Build aggregate counts for the dashboard."""
+    summary: dict[str, int] = {
+        "total": len(prs),
+        "draft": 0,
+        "needs_review": 0,
+        "changes_requested": 0,
+        "stale": 0,
+        "merge_conflict": 0,
+        "blocked": 0,
+        "unknown_merge": 0,
+        "ready": 0,
+    }
+    for pr in prs:
+        for level in pr.get("risk_levels", []):
+            if level in summary:
+                summary[level] += 1
+    return summary
+
 def cmd_issues_list(config: dict[str, Any], args: argparse.Namespace) -> int:
     repo = resolve_repo(config, args.repo)
     payload = run_gh_json([
@@ -270,6 +405,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("pr-view", help="View pull request metadata.")
     p.add_argument("number", type=int)
     p.set_defaults(func=cmd_pr_view)
+
+    p = sub.add_parser("pr-dashboard", help="PR intelligence dashboard with risk analysis.")
+    p.add_argument("--limit", type=int, default=50, help="Max PRs to analyze (default: 50).")
+    p.set_defaults(func=cmd_pr_dashboard)
 
     p = sub.add_parser("issues-list", help="List issues.")
     p.add_argument("--state", choices=["open", "closed", "all"], default="open")

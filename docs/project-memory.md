@@ -105,3 +105,9 @@ Use this file for durable repo-specific context.
 
 - Write tools must remain gated behind explicit confirmation.
 - The server must bind only to `127.0.0.1` or `localhost`.
+
+## Feature 1: PR Intelligence Dashboard
+
+- Added `pr-dashboard` CLI command and `GET /prs/dashboard` server endpoint.
+- Summarizes open PRs with risk classification (draft, needs_review, changes_requested, stale, merge_conflict, blocked, unknown_merge, ready) and recommended next actions.
+- Uses `gh pr list --json` with expanded fields (mergeStateStatus, reviewDecision) and a 7-day staleness threshold.

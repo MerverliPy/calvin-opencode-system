@@ -133,6 +133,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200 if code == 0 else 500, payload)
             return
 
+        if path == "/prs/dashboard":
+            code, payload = run_cli([*base_args, "pr-dashboard", "--limit", limit])
+            self.send_json(200 if code == 0 else 500, payload)
+            return
+
         if path == "/prs":
             code, payload = run_cli([*base_args, "prs-list", "--state", state, "--limit", limit])
             self.send_json(200 if code == 0 else 500, payload)
