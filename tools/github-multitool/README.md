@@ -682,6 +682,138 @@ Force-delete variants (`-D`) are intentionally excluded from safe suggestions.
 - Handles missing `gh` permissions gracefully.
 - Uses subprocess argument lists (no `shell=True`).
 
+
+
+## Issue-to-Branch Workflow (Feature 8)
+
+Turn a GitHub issue into a safe local branch plan. This command is **strictly advisory**
+and read-only — it does not create branches, mutate issues, or execute any commands.
+
+### Usage
+
+```bash
+python3 tools/github-multitool/github_multitool.py issue-plan <ISSUE_NUMBER>
+```
+
+### Example
+
+```bash
+python3 tools/github-multitool/github_multitool.py issue-plan 12
+```
+
+### Expected Output
+
+```json
+{
+  "ok": true,
+  "repository": "MerverliPy/calvin-opencode-system",
+  "issue": {
+    "number": 12,
+    "title": "Add branch cleanup advisor",
+    "state": "OPEN",
+    "url": "https://github.com/...",
+    "author": "username",
+    "labels": ["enhancement"]
+  },
+  "recommended_branch_name": "issue-012-add-branch-cleanup-advisor",
+  "risk": "medium",
+  "risk_reasons": [
+    "enhancement label indicates feature work"
+  ],
+  "first_commands": [
+    "git checkout main",
+    "git pull --ff-only origin main",
+    "git checkout -b issue-012-add-branch-cleanup-advisor"
+  ],
+  "suggested_pr_title": "Resolve #12: Add branch cleanup advisor",
+  "suggested_checklist": [
+    "Confirm issue scope",
+    "Create branch from updated main",
+    "Implement the smallest complete change",
+    "Run tools/github-multitool/smoke-test.sh",
+    "Run ./scripts/verify-opencode-os.sh",
+    "Open PR referencing issue #12"
+  ],
+  "warnings": []
+}
+```
+
+### Branch Name Format
+
+Branch names follow the convention:
+
+```
+issue-<zero-padded-number>-<slugified-title>
+```
+
+Examples:
+
+- Issue 12, "Add branch cleanup advisor" → `issue-012-add-branch-cleanup-advisor`
+- Issue 4, "Fix README links" → `issue-004-fix-readme-links`
+- Issue 127, "Implement new feature" → `issue-127-implement-new-feature`
+
+Rules:
+- Issue number is zero-padded to 3 digits.
+- Title is lowercased with unsafe characters replaced by hyphens.
+- Repeated hyphens are collapsed.
+- Total branch name is trimmed to 70 characters.
+- If the title produces an empty slug, `fix` is used as the fallback.
+
+### Risk Estimate
+
+The tool estimates risk based on issue labels, title, and body content:
+
+| Risk    | Triggers                                                                 |
+|---------|--------------------------------------------------------------------------|
+| `low`   | Documentation, typo, README, guide-only labels or title/body cues        |
+| `medium`| Feature, enhancement, refactor labels or title/body cues                 |
+| `high`  | Security, auth, workflow, CI, deploy, config, secret, token, production, or breaking-change cues |
+
+Risk is determined as the **highest** matching level across labels and body text.
+Labels take priority over title/body cues.
+
+### Checklist
+
+The suggested checklist adapts to issue labels:
+
+| Label(s)                         | Extra Checklist Item                |
+|----------------------------------|-------------------------------------|
+| `documentation`, `docs`, `readme`| Update project-memory.md            |
+| `security`, `token`, `auth`      | Run security audit review           |
+| `workflow`, `ci`, `deploy`       | Validate workflow YAML syntax       |
+| `bug`, `fix`                     | Add test to prevent regression      |
+
+The base checklist always includes scope confirmation, branch creation, minimal
+implementation, smoke test, verification, and PR creation steps.
+
+### Warnings
+
+The command may include warnings for:
+
+- **Issue is closed** — verify the issue should be reopened before starting.
+- **Issue body is empty** — the issue may lack sufficient context for implementation.
+- **Very short slug** — the issue title produces a slug under 5 characters, making the branch name ambiguous.
+- **High-risk labels** — labels matching security/auth/deploy/etc. patterns suggest extra scrutiny.
+
+### Advisory Only — No Commands Executed
+
+This command **never**:
+
+- Creates a branch
+- Assigns, edits, closes, comments on, or mutates the issue
+- Executes `git checkout`, `git pull`, or any other commands
+
+The `first_commands` array shows the suggested sequence for getting started.
+**Review every command before running it manually.**
+
+### Safety
+
+- Read-only: uses `gh issue view --json` via subprocess argument lists (no `shell=True`).
+- Does not create branches, mutate issues, or execute any git commands.
+- Does not print tokens, credentials, or secret values.
+- Handles missing `gh` permissions gracefully.
+- Returns stable JSON output.
+
 ## Smoke Test
 
 Run the local smoke test:

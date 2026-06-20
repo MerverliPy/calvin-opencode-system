@@ -2074,6 +2074,295 @@ def cmd_branches_cleanup_plan(config: dict[str, Any], args: argparse.Namespace) 
     print_json(output)
     return 0
 
+# ---------------------------------------------------------------------------
+# Feature 8: Issue-to-Branch Workflow helpers and command
+# ---------------------------------------------------------------------------
+
+
+def _issue_title_to_branch_slug(number: int, title: str) -> str:
+    """Sanitize an issue title into a safe branch name slug.
+
+    Produces names like: issue-012-short-title, issue-004-fix-readme-links.
+    Strips or replaces unsafe branch-name characters, collapses repeated
+    hyphens, and trims to 70 characters.
+    """
+    padded = f"{number:03d}"
+    safe = title.lower()
+    safe = re.sub(r'[^a-z0-9._-]', '-', safe)
+    safe = re.sub(r'-{2,}', '-', safe)
+    safe = safe.strip('.-')
+    # Truncate to fit within a safe total length
+    prefix = f"issue-{padded}-"
+    max_title_len = 70 - len(prefix)
+    if max_title_len < 8:
+        max_title_len = 8  # floor: at least a few chars
+    if len(safe) > max_title_len:
+        safe = safe[:max_title_len].rstrip('-')
+    if not safe:
+        safe = "fix"
+    return f"issue-{padded}-{safe}"
+
+
+def _estimate_issue_risk(
+    title: str, body: str, labels: list[str],
+) -> tuple[str, list[str]]:
+    """Estimate risk based on issue labels, title, and body.
+
+    Returns (risk_level, list_of_reasons).
+    """
+    text = f"{title} {body}".lower()
+    labels_lower = [lb.lower() for lb in labels] if labels else []
+    reasons: list[str] = []
+
+    high_cues = [
+        "security", "secret", "token", "credential", "auth",
+        "deploy", "ci", "pipeline", "config",
+        "production", "breaking-change", "workflow",
+    ]
+    medium_cues = [
+        "feature", "enhancement", "refactor",
+    ]
+    low_cues = [
+        "documentation", "docs", "readme", "typo",
+        "bug", "fix", "guide", "comment",
+    ]
+
+    risk = "low"
+
+    # Check labels (strongest signal)
+    for label in labels_lower:
+        if risk != "high" and any(c in label for c in high_cues):
+            risk = "high"
+            reasons.append(f"'{label}' label indicates high-risk work")
+        elif risk not in ("high", "medium") and any(c in label for c in medium_cues):
+            risk = "medium"
+            reasons.append(f"'{label}' label indicates feature work")
+        elif risk == "low" and any(c in label for c in low_cues):
+            reasons.append(f"'{label}' label indicates low-risk work")
+
+    # Check title/body for cues (only upgrade, never downgrade)
+    if risk != "high":
+        for cue in high_cues:
+            if cue in text:
+                risk = "high"
+                reasons.append(
+                    f"title/body mentions '{cue}' -- potential high risk"
+                )
+                break
+
+    if risk != "high" and risk != "medium":
+        for cue in medium_cues:
+            if cue in text:
+                risk = "medium"
+                reasons.append(
+                    f"title/body mentions '{cue}' -- feature work"
+                )
+                break
+
+    if not reasons:
+        reasons.append("no specific risk cues detected")
+
+    return risk, reasons
+
+
+def _generate_issue_checklist(
+    number: int, labels: list[str], body: str,
+) -> list[str]:
+    """Generate a suggested checklist based on issue labels and body."""
+    checklist = [
+        "Confirm issue scope",
+        "Create branch from updated main",
+        "Implement the smallest complete change",
+        "Run tools/github-multitool/smoke-test.sh",
+        "Run ./scripts/verify-opencode-os.sh",
+        f"Open PR referencing issue #{number}",
+    ]
+
+    labels_lower = [lb.lower() for lb in labels] if labels else []
+
+    # Insert label-specific items after the first two standard items
+    extra: list[str] = []
+    if any(x in labels_lower
+           for x in ["documentation", "docs", "readme"]):
+        extra.append("Update project-memory.md")
+    if any(x in labels_lower
+           for x in ["security", "token", "secret", "credential", "auth"]):
+        extra.append("Run security audit review")
+    if any(x in labels_lower
+           for x in ["workflow", "ci", "deploy"]):
+        extra.append("Validate workflow YAML syntax")
+    if any(x in labels_lower
+           for x in ["bug", "fix"]):
+        extra.append("Add test to prevent regression")
+
+    # Insert extras after "Create branch from updated main"
+    for item in reversed(extra):
+        checklist.insert(3, item)
+
+    return checklist
+
+
+def _generate_issue_warnings(
+    issue_data: dict[str, Any], branch_name: str,
+) -> list[str]:
+    """Generate warnings for the issue-to-branch plan."""
+    warnings: list[str] = []
+
+    state = (issue_data.get("state") or "").upper()
+    if state == "CLOSED":
+        warnings.append(
+            "Issue is closed - verify it should be reopened"
+        )
+
+    body = (issue_data.get("body") or "").strip()
+    if not body:
+        warnings.append(
+            "Issue body is empty - may lack sufficient context"
+        )
+
+    # Check for very short slug
+    slug = branch_name
+    if "issue-" in slug:
+        parts = slug.split("issue-", 1)[-1].split("-", 1)
+        if len(parts) > 1:
+            slug_suffix = parts[1]
+        else:
+            slug_suffix = ""
+    else:
+        slug_suffix = slug
+
+    if len(slug_suffix) < 5:
+        warnings.append(
+            f"Title produces a very short slug "
+            f"({slug_suffix!r}) - branch name may be ambiguous"
+        )
+
+    # Check for high-risk labels
+    raw_labels = issue_data.get("labels") or []
+    high_cues = [
+        "security", "secret", "token", "credential", "auth",
+        "deploy", "ci", "pipeline", "config",
+        "production", "breaking-change",
+    ]
+    for label in raw_labels:
+        label_name = (
+            label.get("name", str(label))
+            if isinstance(label, dict)
+            else str(label)
+        ).lower()
+        for cue in high_cues:
+            if cue in label_name:
+                warnings.append(
+                    f"High-risk label '{label_name}' detected "
+                    f"- review with extra care"
+                )
+                break
+
+    return warnings
+
+
+def cmd_issue_plan(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Issue-to-Branch Workflow: turn a GitHub issue into a safe local branch plan.
+
+    This command is strictly advisory and read-only.  It does **not**:
+
+    * create a branch
+    * assign, edit, close, label, comment on, or mutate the issue
+    * execute any git commands
+
+    It produces a stable JSON plan that must be reviewed before any
+    manual action is taken.
+    """
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+    number: int = args.number
+
+    # Fetch issue metadata
+    try:
+        issue_data = run_gh_json([
+            "issue", "view", str(number),
+            "--repo", repo,
+            "--json", "number,title,state,author,labels,url,body",
+        ])
+    except ToolError as exc:
+        print_json({"ok": False, "error": f"Failed to fetch issue: {exc}"})
+        return 2
+
+    if not isinstance(issue_data, dict):
+        issue_data = {}
+
+    title = (issue_data.get("title") or "").strip()
+    state = (issue_data.get("state") or "UNKNOWN").upper()
+    url = issue_data.get("url", "") or ""
+    body = issue_data.get("body", "") or ""
+
+    # Normalize author
+    author_data = issue_data.get("author") or {}
+    if isinstance(author_data, dict):
+        author = author_data.get("login", "unknown")
+    else:
+        author = str(author_data) if author_data else "unknown"
+
+    # Normalize labels to plain strings
+    raw_labels = issue_data.get("labels") or []
+    if isinstance(raw_labels, list):
+        labels = [
+            lb.get("name", str(lb)) if isinstance(lb, dict) else str(lb)
+            for lb in raw_labels
+        ]
+    else:
+        labels = []
+
+    # Generate branch name slug
+    branch_name = _issue_title_to_branch_slug(number, title)
+
+    # Estimate risk
+    risk, risk_reasons = _estimate_issue_risk(title, body, labels)
+
+    # Generate checklist
+    checklist = _generate_issue_checklist(number, labels, body)
+
+    # Build first commands (never executed)
+    first_commands = [
+        "git checkout main",
+        "git pull --ff-only origin main",
+        f"git checkout -b {branch_name}",
+    ]
+
+    # Suggested PR title
+    if title:
+        suggested_pr_title = f"Resolve #{number}: {title}"
+    else:
+        suggested_pr_title = f"Resolve #{number}"
+
+    # Build normalized issue info
+    issue_info: dict[str, Any] = {
+        "number": number,
+        "title": title,
+        "state": state,
+        "url": url,
+        "author": author,
+        "labels": labels,
+    }
+
+    # Generate warnings
+    warnings = _generate_issue_warnings(issue_data, branch_name)
+
+    output: dict[str, Any] = {
+        "ok": True,
+        "repository": repo,
+        "issue": issue_info,
+        "recommended_branch_name": branch_name,
+        "risk": risk,
+        "risk_reasons": risk_reasons,
+        "first_commands": first_commands,
+        "suggested_pr_title": suggested_pr_title,
+        "suggested_checklist": checklist,
+        "warnings": warnings,
+    }
+    print_json(output)
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="github_multitool.py",
@@ -2160,6 +2449,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("branches-cleanup-plan", help="Branch Cleanup Advisor: identify branches safe to delete (advisory only).")
     p.set_defaults(func=cmd_branches_cleanup_plan)
 
+    p = sub.add_parser("issue-plan", help="Issue-to-Branch Workflow: turn a GitHub issue into a safe local branch plan (advisory only).")
+    p.add_argument("number", type=int, help="Issue number to plan from.")
+    p.set_defaults(func=cmd_issue_plan)
 
 
 
