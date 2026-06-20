@@ -59,6 +59,32 @@ while IFS= read -r file; do
 done < <(find .opencode/skills -mindepth 2 -maxdepth 2 -type f -name 'SKILL.md' | sort)
 
 echo
+echo "== Registry path validity =="
+
+extract_registry_paths() {
+  local registry="$1"
+  grep -oE '`[^`]+`' "$registry" 2>/dev/null \
+    | tr -d '`' \
+    | grep -E '^\.opencode/(agents|commands|skills)/' \
+    | sort -u
+}
+
+while IFS= read -r path; do
+  [[ -n "$path" ]] || continue
+  check "registered path exists: $path" test -e "$path"
+done < <(extract_registry_paths registries/agent-registry.md)
+
+while IFS= read -r path; do
+  [[ -n "$path" ]] || continue
+  check "registered path exists: $path" test -e "$path"
+done < <(extract_registry_paths registries/command-registry.md)
+
+while IFS= read -r path; do
+  [[ -n "$path" ]] || continue
+  check "registered path exists: $path" test -e "$path"
+done < <(extract_registry_paths registries/skill-registry.md)
+
+echo
 echo "== Generated files staging check =="
 if git diff --cached --name-only | grep -q '^dist/'; then
   echo "[FAIL] dist files are staged"
