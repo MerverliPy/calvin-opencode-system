@@ -3032,6 +3032,296 @@ def cmd_branch_protection(config: dict[str, Any], args: argparse.Namespace) -> i
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Feature 12: Terminal UI Dashboard helpers and command
+# ---------------------------------------------------------------------------
+
+
+def _aggregate_dashboard_data(config, repo):
+    """Aggregate dashboard data from multiple read-only gh calls.
+
+    Returns a dict with all dashboard fields.  Never crashes when a backend
+    call fails --- reports ``unavailable`` instead.
+    """
+    require_gh()
+    warnings_list = []
+
+    # --- Repository visibility ---
+    try:
+        vis_data = run_gh_json([
+            "repo", "view", repo,
+            "--json", "nameWithOwner,visibility,isPrivate,defaultBranchRef",
+        ])
+    except ToolError as exc:
+        return {"ok": False, "error": f"Failed to fetch repository: {exc}"}
+
+    repository = vis_data.get("nameWithOwner", repo)
+    visibility = (vis_data.get("visibility") or "UNKNOWN").upper()
+    is_private = vis_data.get("isPrivate", None)
+    is_public = is_private is False or visibility == "PUBLIC"
+
+    # --- Default branch ---
+    default_branch_ref = vis_data.get("defaultBranchRef") or {}
+    if isinstance(default_branch_ref, dict):
+        default_branch = default_branch_ref.get("name", "")
+    else:
+        default_branch = ""
+    if not default_branch:
+        try:
+            default_branch = _get_default_branch(repo)
+        except Exception:
+            default_branch = "main"
+
+    # --- Open PR count ---
+    try:
+        prs = run_gh_json([
+            "pr", "list", "--repo", repo,
+            "--state", "open", "--limit", "200",
+            "--json", "number",
+        ])
+        open_prs = len(prs) if isinstance(prs, list) else 0
+    except ToolError:
+        open_prs = -1
+        warnings_list.append("Open PR count unavailable.")
+
+    # --- Open issue count ---
+    try:
+        issues = run_gh_json([
+            "issue", "list", "--repo", repo,
+            "--state", "open", "--limit", "200",
+            "--json", "number",
+        ])
+        open_issues = len(issues) if isinstance(issues, list) else 0
+    except ToolError:
+        open_issues = -1
+        warnings_list.append("Open issue count unavailable.")
+
+    # --- Failed run count ---
+    try:
+        failed = run_gh_json([
+            "run", "list", "--repo", repo,
+            "--status", "failure", "--limit", "20",
+            "--json", "databaseId",
+        ])
+        failed_runs = len(failed) if isinstance(failed, list) else 0
+    except ToolError:
+        failed_runs = -1
+        warnings_list.append("Failed run count unavailable.")
+
+    # --- Branch protection ---
+    bp_status = "unavailable"
+    bp_protected = False
+    try:
+        branch_protection = _check_branch_protection(repo, default_branch)
+        bp_status = branch_protection.get("status", "unavailable")
+        bp_protected = bool(branch_protection.get("protected", False))
+    except Exception:
+        warnings_list.append("Branch protection check failed.")
+
+    # --- Security alerts ---
+    sec_statuses = {}
+    total_alerts = None
+    alerts_available = False
+    try:
+        dependabot = _check_alert_endpoint(repo, "dependabot")
+        code_scanning = _check_alert_endpoint(repo, "code-scanning")
+        secret_scanning = _check_alert_endpoint(repo, "secret-scanning")
+        sec_statuses["dependabot"] = dependabot.get("status", "unavailable")
+        sec_statuses["code_scanning"] = code_scanning.get("status", "unavailable")
+        sec_statuses["secret_scanning"] = secret_scanning.get("status", "unavailable")
+
+        alerts_available = any(
+            a.get("status") == "available"
+            for a in [dependabot, code_scanning, secret_scanning]
+        )
+        if alerts_available:
+            total_alerts = 0
+            for alert_src in [dependabot, code_scanning, secret_scanning]:
+                if alert_src.get("status") == "available" and alert_src.get("open_count") is not None:
+                    total_alerts += int(alert_src["open_count"])
+    except Exception:
+        sec_statuses = {
+            "dependabot": "unavailable",
+            "code_scanning": "unavailable",
+            "secret_scanning": "unavailable",
+        }
+        warnings_list.append("Security alert check failed.")
+
+    # --- Repo guard summary ---
+    block_on_public = bool(config.get("block_writes_on_public_repo", True))
+    allow_override = bool(config.get("allow_public_repo_write_override", False))
+
+    if is_public and block_on_public and not allow_override:
+        repo_guard_summary = "writes blocked (public)"
+        write_tools_blocked = True
+    elif is_public and allow_override:
+        repo_guard_summary = "writes allowed (override)"
+        write_tools_blocked = False
+    elif is_public:
+        repo_guard_summary = "writes allowed (no block)"
+        write_tools_blocked = False
+    else:
+        repo_guard_summary = "private"
+        write_tools_blocked = False
+
+    # --- Recommended next action (priority-ordered) ---
+    if is_public:
+        if not allow_override:
+            warnings_list.append(
+                "Repository is public. Write tools are blocked by visibility guard."
+            )
+        recommended = (
+            "Fix repository visibility if this repo should be private."
+        )
+    elif failed_runs > 0:
+        recommended = (
+            "Investigate {} failed workflow run(s).".format(failed_runs)
+        )
+    elif bp_status != "available" or not bp_protected:
+        recommended = (
+            "Enable branch protection for the default branch."
+        )
+    elif not alerts_available:
+        recommended = (
+            "Review GitHub security alert availability."
+        )
+    elif total_alerts is not None and total_alerts > 0:
+        recommended = (
+            "{} open security alert(s) detected.".format(total_alerts)
+        )
+    elif open_prs > 0:
+        recommended = "Review open pull requests."
+    else:
+        recommended = "No active work. Run next-action later."
+
+    return {
+        "ok": True,
+        "repository": repository,
+        "visibility": visibility,
+        "default_branch": default_branch,
+        "open_prs": open_prs,
+        "open_issues": open_issues,
+        "failed_runs": failed_runs,
+        "branch_protection_status": bp_status,
+        "branch_protection_protected": bp_protected,
+        "security_statuses": sec_statuses,
+        "security_alerts_available": alerts_available,
+        "security_total_alerts": total_alerts,
+        "repo_guard_summary": repo_guard_summary,
+        "is_public": is_public,
+        "write_tools_blocked": write_tools_blocked,
+        "recommended_next_action": recommended,
+        "warnings": warnings_list,
+    }
+
+
+def cmd_dashboard(config, args):
+    """Terminal UI Dashboard --- compact overview optimised for Termius/iPhone.
+
+    Default output is narrow human-readable text.
+    ``--json`` produces stable JSON for agent consumption.
+    """
+    repo = resolve_repo(config, args.repo)
+    use_json = getattr(args, "json_output", False)
+
+    aggregated = _aggregate_dashboard_data(config, repo)
+    if not aggregated.get("ok"):
+        if use_json:
+            print_json(aggregated)
+        else:
+            print("Error: {}".format(aggregated.get("error", "unknown error")))
+        return 2
+
+    repository = aggregated["repository"]
+    visibility = aggregated["visibility"]
+    default_branch = aggregated["default_branch"]
+    open_prs = aggregated["open_prs"]
+    open_issues = aggregated["open_issues"]
+    failed_runs = aggregated["failed_runs"]
+    bp_status = aggregated["branch_protection_status"]
+    bp_protected = aggregated["branch_protection_protected"]
+    sec_statuses = aggregated["security_statuses"]
+    alerts_available = aggregated["security_alerts_available"]
+    total_alerts = aggregated["security_total_alerts"]
+    repo_guard_summary = aggregated["repo_guard_summary"]
+    is_public = aggregated["is_public"]
+    write_tools_blocked = aggregated["write_tools_blocked"]
+    recommended = aggregated["recommended_next_action"]
+    warnings_list = aggregated["warnings"]
+
+    if use_json:
+        result = {
+            "ok": True,
+            "repository": repository,
+            "visibility": visibility,
+            "default_branch": default_branch,
+            "open_prs": open_prs if open_prs >= 0 else None,
+            "open_issues": open_issues if open_issues >= 0 else None,
+            "failed_runs": failed_runs if failed_runs >= 0 else None,
+            "branch_protection": {
+                "status": bp_status,
+                "protected": bp_protected,
+            },
+            "security_summary": {
+                "dependabot": sec_statuses.get("dependabot", "unavailable"),
+                "code_scanning": sec_statuses.get("code_scanning", "unavailable"),
+                "secret_scanning": sec_statuses.get("secret_scanning", "unavailable"),
+                "alerts_available": alerts_available,
+                "total_open_alerts": total_alerts if alerts_available else None,
+            },
+            "repo_guard": {
+                "is_public": is_public,
+                "write_tools_blocked": write_tools_blocked,
+                "summary": repo_guard_summary,
+            },
+            "recommended_next_action": recommended,
+            "warnings": warnings_list,
+        }
+        print_json(result)
+        return 0
+
+    # --- Human-readable compact output ---
+    pr_str = str(open_prs) if open_prs >= 0 else "unavailable"
+    issue_str = str(open_issues) if open_issues >= 0 else "unavailable"
+    failed_str = str(failed_runs) if failed_runs >= 0 else "unavailable"
+
+    if bp_status == "available":
+        bp_str = "enabled" if bp_protected else "not enabled"
+    else:
+        bp_str = "unavailable"
+
+    if alerts_available:
+        t = total_alerts if total_alerts is not None else 0
+        sec_str = "{} open".format(t) if t > 0 else "none detected"
+    else:
+        sec_str = "unavailable"
+
+    lines = [
+        "GitHub Multitool Dashboard",
+        "Repo: {}".format(repository),
+        "Visibility: {}".format(visibility),
+        "Default branch: {}".format(default_branch),
+        "Open PRs: {}".format(pr_str),
+        "Open Issues: {}".format(issue_str),
+        "Failed Runs: {}".format(failed_str),
+        "Branch Protection: {}".format(bp_str),
+        "Security Alerts: {}".format(sec_str),
+        "Repo Guard: {}".format(repo_guard_summary),
+    ]
+
+    if warnings_list:
+        lines.append("")
+        for w in warnings_list:
+            lines.append("WARNING: {}".format(w))
+
+    lines.append("")
+    lines.append("Recommended next action:")
+    lines.append("  {}".format(recommended))
+
+    print("\n".join(lines))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="github_multitool.py",
@@ -3131,6 +3421,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("branch-protection", help="Inspect branch protection rules (read-only).")
     p.add_argument("branch", help="Branch name to inspect (e.g. main).")
     p.set_defaults(func=cmd_branch_protection)
+
+
+    p = sub.add_parser("dashboard", help="Terminal UI Dashboard: compact overview for Termius/iPhone (read-only).")
+    p.add_argument("--json", dest="json_output", action="store_true",
+                   help="Output stable JSON for agent/script consumption.")
+    p.set_defaults(func=cmd_dashboard)
 
     return parser
 

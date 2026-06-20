@@ -1127,6 +1127,123 @@ from the API response, `raw_availability` is `"available"`, and
   availability.
 
 
+## Terminal UI Dashboard (Feature 12)
+
+A compact terminal dashboard optimized for Termius/iPhone usage. Provides a
+single-command overview of the repository's health: PRs, issues, failed runs,
+branch protection, security alerts, and repo guard status — plus a prioritized
+recommended next action.
+
+### Usage
+
+```bash
+python3 tools/github-multitool/github_multitool.py dashboard
+python3 tools/github-multitool/github_multitool.py dashboard --json
+```
+
+### Human-Readable Output
+
+The default output is narrow, plain-text, and optimized for mobile terminals
+like Termius on iPhone. It includes:
+
+- Repository name and visibility
+- Default branch
+- Open PR count
+- Open issue count
+- Failed workflow run count
+- Branch protection status
+- Security alert availability and count
+- Repo guard summary
+- Prioritized recommended next action
+- Warnings (public repo, unavailable APIs, etc.)
+
+Example:
+
+```text
+GitHub Multitool Dashboard
+Repo: MerverliPy/calvin-opencode-system
+Visibility: PUBLIC
+Default branch: main
+Open PRs: 0
+Open Issues: 0
+Failed Runs: 0
+Branch Protection: unavailable
+Security Alerts: none detected
+Repo Guard: writes blocked (public)
+
+Recommended next action:
+  Fix repository visibility if this repo should be private.
+```
+
+### JSON Output
+
+The `--json` flag produces stable, parseable JSON for agent and script
+consumption. All fields are guaranteed to be present even when backend
+calls fail — unavailable data is reported as `null` or `"unavailable"`.
+
+```bash
+python3 tools/github-multitool/github_multitool.py dashboard --json
+```
+
+Example JSON shape:
+
+```json
+{
+  "ok": true,
+  "repository": "MerverliPy/calvin-opencode-system",
+  "visibility": "PUBLIC",
+  "default_branch": "main",
+  "open_prs": 0,
+  "open_issues": 0,
+  "failed_runs": 0,
+  "branch_protection": {
+    "status": "not_protected_or_unavailable",
+    "protected": false
+  },
+  "security_summary": {
+    "dependabot": "available",
+    "code_scanning": "unavailable",
+    "secret_scanning": "unavailable",
+    "alerts_available": true,
+    "total_open_alerts": 0
+  },
+  "repo_guard": {
+    "is_public": true,
+    "write_tools_blocked": true,
+    "summary": "writes blocked (public)"
+  },
+  "recommended_next_action": "Fix repository visibility if this repo should be private.",
+  "warnings": []
+}
+```
+
+### Recommended Next Action Priority
+
+The dashboard recommends the most important action in this order:
+
+| Priority | Condition                          | Recommendation                                    |
+|----------|------------------------------------|---------------------------------------------------|
+| 1        | Repository is public               | Fix repository visibility if this repo should be private. |
+| 2        | Failed workflow runs exist         | Investigate N failed workflow run(s).             |
+| 3        | Branch protection missing/off      | Enable branch protection for the default branch.  |
+| 4        | Security alert APIs unavailable    | Review GitHub security alert availability.        |
+| 5        | Open security alerts exist         | N open security alert(s) detected.                |
+| 6        | Open PRs need review               | Review open pull requests.                        |
+| 7        | No active work detected            | No active work. Run next-action later.            |
+
+### Design Notes
+
+- **Read-only**: Uses `gh repo view`, `gh pr list`, `gh issue list`,
+  `gh run list`, and `gh api` only. Never mutates GitHub.
+- **Graceful degradation**: If a backend call fails (missing permissions,
+  unavailable API features), the field is reported as `unavailable` or `null`
+  rather than crashing.
+- **No `shell=True`**: All subprocess calls use argument lists.
+- **No token exposure**: Never prints tokens, credentials, or secret values.
+- **Reuses existing helpers**: Reuses `_check_branch_protection`,
+  `_check_alert_endpoint`, and `_get_default_branch` from prior features.
+
+
 ## Smoke Test
 
 Run the local smoke test:

@@ -1138,5 +1138,129 @@ else
   echo "[PASS] Server /branch/main/protection (graceful error)"
 fi
 
+
+# -- Feature 12: Terminal UI Dashboard smoke tests ---------------
+
+echo
+echo "== CLI dashboard --help =="
+python3 tools/github-multitool/github_multitool.py dashboard --help > /tmp/github-multitool-dashboard-help.txt
+cat /tmp/github-multitool-dashboard-help.txt
+echo
+echo "[PASS] CLI dashboard --help"
+
+echo
+echo "== CLI dashboard (human-readable) =="
+set +e
+python3 tools/github-multitool/github_multitool.py dashboard > /tmp/github-multitool-dashboard.txt 2>/tmp/github-multitool-dashboard.err
+dashboard_exit=$?
+set -e
+
+cat /tmp/github-multitool-dashboard.txt
+
+# Human output must contain expected section labels
+expected_labels=("GitHub Multitool Dashboard" "Repo:" "Visibility:" "Default branch:" "Open PRs:" "Open Issues:" "Failed Runs:" "Branch Protection:" "Security Alerts:" "Repo Guard:" "Recommended next action:")
+for label in "${expected_labels[@]}"; do
+  if ! grep -qF "$label" /tmp/github-multitool-dashboard.txt; then
+    echo "[FAIL] Human dashboard output missing label: $label"
+    exit 1
+  fi
+done
+
+echo
+echo "[PASS] CLI dashboard (human-readable)"
+
+echo
+echo "== CLI dashboard --json =="
+python3 tools/github-multitool/github_multitool.py dashboard --json > /tmp/github-multitool-dashboard.json
+
+cat /tmp/github-multitool-dashboard.json
+
+# Validate JSON output shape
+ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-dashboard.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+" 2>/dev/null || echo "")"
+
+if [[ "$ok_val" != "True" ]]; then
+  echo "[FAIL] CLI dashboard --json missing ok=true"
+  exit 1
+fi
+
+# Verify all required JSON fields exist
+for field in repository visibility default_branch open_prs open_issues failed_runs branch_protection security_summary repo_guard recommended_next_action warnings; do
+  val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-dashboard.json') as f:
+    d = json.load(f)
+print(d.get('$field', '__MISSING__'))
+" 2>/dev/null || echo "__MISSING__")"
+  if [[ "$val" == "__MISSING__" ]]; then
+    echo "[FAIL] CLI dashboard --json missing field: $field"
+    exit 1
+  fi
+done
+
+# Verify branch_protection sub-fields
+for bp_field in status protected; do
+  bpv="$(python3 -c "
+import json
+with open('/tmp/github-multitool-dashboard.json') as f:
+    d = json.load(f)
+bp = d.get('branch_protection', {})
+print(bp.get('$bp_field', '__MISSING__'))
+" 2>/dev/null || echo "__MISSING__")"
+  if [[ "$bpv" == "__MISSING__" ]]; then
+    echo "[FAIL] CLI dashboard --json branch_protection missing field: $bp_field"
+    exit 1
+  fi
+done
+
+# Verify security_summary sub-fields
+for sec_field in dependabot code_scanning secret_scanning alerts_available; do
+  sv="$(python3 -c "
+import json
+with open('/tmp/github-multitool-dashboard.json') as f:
+    d = json.load(f)
+ss = d.get('security_summary', {})
+print(ss.get('$sec_field', '__MISSING__'))
+" 2>/dev/null || echo "__MISSING__")"
+  if [[ "$sv" == "__MISSING__" ]]; then
+    echo "[FAIL] CLI dashboard --json security_summary missing field: $sec_field"
+    exit 1
+  fi
+done
+
+# Verify repo_guard sub-fields
+for rg_field in is_public write_tools_blocked summary; do
+  rv="$(python3 -c "
+import json
+with open('/tmp/github-multitool-dashboard.json') as f:
+    d = json.load(f)
+rg = d.get('repo_guard', {})
+print(rg.get('$rg_field', '__MISSING__'))
+" 2>/dev/null || echo "__MISSING__")"
+  if [[ "$rv" == "__MISSING__" ]]; then
+    echo "[FAIL] CLI dashboard --json repo_guard missing field: $rg_field"
+    exit 1
+  fi
+done
+
+# Verify warnings is a list
+warnings_type="$(python3 -c "
+import json
+with open('/tmp/github-multitool-dashboard.json') as f:
+    d = json.load(f)
+print(type(d.get('warnings', [])).__name__)
+" 2>/dev/null || echo "")"
+if [[ "$warnings_type" != "list" ]]; then
+  echo "[FAIL] CLI dashboard --json warnings is not a list"
+  exit 1
+fi
+
+echo
+echo "[PASS] CLI dashboard --json"
+
 echo "== Final result =="
 echo "[PASS] GitHub multitool smoke test completed successfully."
