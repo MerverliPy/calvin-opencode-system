@@ -83,3 +83,18 @@ curl http://127.0.0.1:8765/runs
 ~~~~
 
 The MVP server intentionally rejects POST, PUT, and DELETE requests.
+
+## Smoke Test
+
+Run the local smoke test:
+
+~~~~bash
+tools/github-multitool/smoke-test.sh
+~~~~
+
+The smoke test checks:
+
+- Python syntax
+- CLI health
+- localhost server health
+- read-only repo status endpoint
