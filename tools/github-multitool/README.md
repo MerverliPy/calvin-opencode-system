@@ -814,6 +814,105 @@ The `first_commands` array shows the suggested sequence for getting started.
 - Handles missing `gh` permissions gracefully.
 - Returns stable JSON output.
 
+## Repo Visibility Guard (Feature 9)
+
+Check repository visibility and enforce write protection on public repositories.
+This guard prevents accidental write operations to public repos that should
+remain private for security.
+
+### Usage
+
+```bash
+python3 tools/github-multitool/github_multitool.py repo-guard
+```
+
+### Expected Output (Public Repo)
+
+```json
+{
+  "ok": true,
+  "repository": "MerverliPy/calvin-opencode-system",
+  "visibility": "PUBLIC",
+  "is_private": false,
+  "write_tools_enabled": false,
+  "block_writes_on_public_repo": true,
+  "allow_public_repo_write_override": false,
+  "write_tools_blocked": true,
+  "warnings": [
+    "Repository is public. Write-capable tools are blocked by repo visibility guard."
+  ],
+  "recommended_next_action": "Make the repository private or keep write tools disabled."
+}
+```
+
+### Config Flags
+
+| Flag                                | Default | Description                                                   |
+|-------------------------------------|---------|---------------------------------------------------------------|
+| `block_writes_on_public_repo`      | `true`  | Block write-capable commands when repository is public.       |
+| `allow_public_repo_write_override` | `false` | Allow write operations on public repos (advanced/risky).      |
+
+These flags work alongside the existing `allow_write_tools` gate. The
+visibility guard is an **additional** gate, not a replacement. Both
+`allow_write_tools` and the visibility guard must pass before any
+write operation is executed.
+
+### Public Repo Behavior
+
+When the repository is public and `block_writes_on_public_repo` is `true`
+(the default):
+
+- **Read-only commands continue to work normally** — `pr-dashboard`,
+  `pr-readiness`, `pr-review-pack`, `runs-failed`, `run-explain`,
+  `pr-body`, `branches-cleanup-plan`, `issue-plan`, `repo-guard`,
+  and all other read-only commands are unaffected.
+- **Write-capable commands are blocked** — `pr-create` (and future
+  write commands) refuse with:
+
+  ```json
+  {
+    "ok": false,
+    "error": "Repository visibility guard blocked write operation because repository is public."
+  }
+  ```
+
+### Private Repo Behavior
+
+When the repository is private:
+
+- `write_tools_blocked` is `false` (unless other gates block writes).
+- No visibility-related warnings are shown.
+- Write-capable commands pass through to normal gating (`allow_write_tools`,
+  `--confirm`, etc.).
+
+### Override (Advanced/Risky)
+
+**⚠️ Public repo write override is advanced/risky.**
+
+To allow write operations on a public repository, set:
+
+```json
+{
+  "allow_public_repo_write_override": true
+}
+```
+
+This is intended only for temporary use during testing or when the
+public nature of the repository is intentional and understood.
+
+**Recommendation:** Enable the override only for the duration of the
+operation, then disable it.
+
+### Safety
+
+- Read-only by default for public repos.
+- Uses `gh repo view --json visibility,isPrivate`.
+- Does not print tokens, credentials, or secret values.
+- Uses subprocess argument lists (no `shell=True`).
+- Handles missing `gh` permissions gracefully.
+- Returns stable JSON output.
+
+
 ## Smoke Test
 
 Run the local smoke test:
@@ -838,4 +937,5 @@ The smoke test checks:
 - server branches list endpoint
 - server strict-private route behavior
 - rejection of write HTTP methods
+ - CLI repo-guard
  - CLI pr-body generation (with safe fallback on main branch)

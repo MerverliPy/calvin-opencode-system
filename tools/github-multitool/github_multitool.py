@@ -35,6 +35,8 @@ DEFAULT_CONFIG = {
     "allow_write_tools": False,
     "warn_public_repositories": True,
     "strict_private": False,
+    "block_writes_on_public_repo": True,
+    "allow_public_repo_write_override": False,
 }
 
 
@@ -111,6 +113,36 @@ def _check_allow_write_tools(config: dict[str, Any]) -> None:
             "Write tools are disabled. "
             "Set allow_write_tools=true in config to enable gated write commands."
         )
+
+
+
+def _repo_visibility_blocks_writes(config: dict[str, Any], repo: str) -> bool:
+    """Check if the repo visibility guard blocks write operations.
+
+    Returns True when: repo is public, block_writes_on_public_repo is True,
+    and allow_public_repo_write_override is False.
+    """
+    block_on_public = bool(config.get("block_writes_on_public_repo", True))
+    allow_override = bool(config.get("allow_public_repo_write_override", False))
+
+    # If block_on_public is false or override is true, don't block
+    if not block_on_public or allow_override:
+        return False
+
+    # Check actual repo visibility
+    try:
+        vis_data = run_gh_json([
+            "repo", "view", repo,
+            "--json", "visibility,isPrivate",
+        ])
+    except ToolError:
+        return False
+
+    is_private = vis_data.get("isPrivate", None)
+    visibility = (vis_data.get("visibility") or "").upper()
+    is_public = is_private is False or visibility == "PUBLIC"
+
+    return is_public
 
 
 def _git_working_tree_clean() -> bool:
@@ -910,6 +942,8 @@ def cmd_health(config: dict[str, Any], args: argparse.Namespace) -> int:
         "allow_write_tools": bool(config.get("allow_write_tools", False)),
         "warn_public_repositories": bool(config.get("warn_public_repositories", True)),
         "strict_private": bool(config.get("strict_private", False)),
+        "block_writes_on_public_repo": bool(config.get("block_writes_on_public_repo", True)),
+        "allow_public_repo_write_override": bool(config.get("allow_public_repo_write_override", False)),
         "default_repository": config.get("default_repository"),
         "allowed_repositories": config.get("allowed_repositories", []),
     }
@@ -936,6 +970,74 @@ def cmd_repo_status(config: dict[str, Any], args: argparse.Namespace) -> int:
         payload["safety_warnings"] = warnings
 
     print_json(payload)
+    return 0
+
+
+def cmd_repo_guard(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Check repository visibility and enforce write protection on public repos."""
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+
+    # Fetch visibility
+    try:
+        vis_data = run_gh_json([
+            "repo", "view", repo,
+            "--json", "nameWithOwner,visibility,isPrivate",
+        ])
+    except ToolError as exc:
+        print_json({"ok": False, "error": f"Failed to fetch repo visibility: {exc}"})
+        return 2
+
+    visibility = (vis_data.get("visibility") or "UNKNOWN").upper()
+    is_private = vis_data.get("isPrivate", None)
+
+    # Config flags
+    write_tools_enabled = bool(config.get("allow_write_tools", False))
+    block_on_public = bool(config.get("block_writes_on_public_repo", True))
+    allow_override = bool(config.get("allow_public_repo_write_override", False))
+
+    # Determine if writes should be blocked
+    is_public = is_private is False or visibility == "PUBLIC"
+
+    write_tools_blocked = False
+    warnings: list[str] = []
+
+    if is_public:
+        warnings.append(
+            "Repository is public. Write-capable tools are blocked by repo visibility guard."
+        )
+        if block_on_public and not allow_override:
+            write_tools_blocked = True
+        elif allow_override:
+            warnings.append(
+                "Public repo write override is enabled. Write operations are conditionally allowed."
+            )
+    else:
+        warnings.append("Repository is private. No visibility-based write restrictions.")
+
+    # Recommended next action
+    if write_tools_blocked:
+        recommended_action = "Make the repository private or keep write tools disabled."
+    elif is_public and allow_override:
+        recommended_action = "Public repo write override is active. Proceed with caution."
+    elif is_public:
+        recommended_action = "Repository is public but writes are not blocked by guard. Verify config."
+    else:
+        recommended_action = "Repository is private. No visibility-based write restrictions."
+
+    result = {
+        "ok": True,
+        "repository": repo,
+        "visibility": visibility,
+        "is_private": is_private,
+        "write_tools_enabled": write_tools_enabled,
+        "block_writes_on_public_repo": block_on_public,
+        "allow_public_repo_write_override": allow_override,
+        "write_tools_blocked": write_tools_blocked,
+        "warnings": warnings,
+        "recommended_next_action": recommended_action,
+    }
+    print_json(result)
     return 0
 
 
@@ -1415,7 +1517,12 @@ def cmd_pr_create(config: dict[str, Any], args: argparse.Namespace) -> int:
         return 1
 
     # Gate 9: Repository visibility guard
-    # (handled implicitly by resolve_repo and config validation)
+    if _repo_visibility_blocks_writes(config, repo):
+        print_json({
+            "ok": False,
+            "error": "Repository visibility guard blocked write operation because repository is public."
+        })
+        return 1
 
     # ── Safe PR preview (stderr) ──────────────────────────────────
     preview_lines = [
@@ -2382,6 +2489,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail if the repository is public.",
     )
     p.set_defaults(func=cmd_repo_status)
+
+    p = sub.add_parser("repo-guard", help="Check repository visibility and enforce write protection on public repos.")
+    p.set_defaults(func=cmd_repo_guard)
 
     p = sub.add_parser("prs-list", help="List pull requests.")
     p.add_argument("--state", choices=["open", "closed", "all"], default="open")

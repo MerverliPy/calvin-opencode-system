@@ -689,5 +689,234 @@ print(d.get('error', ''))
   echo "[PASS] CLI branches-cleanup-plan (graceful error: $error_val)"
 fi
 
+
+# -- Feature 8: Issue-to-Branch Workflow smoke tests --------------
+
+echo
+echo "== CLI issue-plan --help =="
+python3 tools/github-multitool/github_multitool.py issue-plan --help > /tmp/github-multitool-issue-plan-help.txt
+cat /tmp/github-multitool-issue-plan-help.txt
+echo
+echo "[PASS] CLI issue-plan --help"
+
+echo
+echo "== CLI issue-plan =="
+# Find first open issue number from the issues list, or skip with safe fallback
+ISSUE_NUMBER="$(python3 -c "
+import json
+try:
+    with open('/tmp/github-multitool-server-issues.json') as f:
+        issues = json.load(f)
+    if isinstance(issues, list) and issues:
+        print(issues[0].get('number', ''))
+except Exception:
+    pass
+" 2>/dev/null || echo "")"
+
+if [[ -n "$ISSUE_NUMBER" ]]; then
+  python3 tools/github-multitool/github_multitool.py issue-plan "$ISSUE_NUMBER" > /tmp/github-multitool-issue-plan.json
+  cat /tmp/github-multitool-issue-plan.json
+
+  # Validate JSON output shape
+  ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-issue-plan.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+" 2>/dev/null || echo "")"
+
+  if [[ "$ok_val" != "True" ]]; then
+    echo "[FAIL] CLI issue-plan missing ok=true"
+    exit 1
+  fi
+
+  # Verify required fields exist
+  repo_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-issue-plan.json') as f:
+    d = json.load(f)
+print(d.get('repository', ''))
+" 2>/dev/null || echo "")"
+  branch_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-issue-plan.json') as f:
+    d = json.load(f)
+print(d.get('recommended_branch_name', ''))
+" 2>/dev/null || echo "")"
+  risk_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-issue-plan.json') as f:
+    d = json.load(f)
+print(d.get('risk', ''))
+" 2>/dev/null || echo "")"
+  pr_title_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-issue-plan.json') as f:
+    d = json.load(f)
+print(d.get('suggested_pr_title', ''))
+" 2>/dev/null || echo "")"
+  checklist_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-issue-plan.json') as f:
+    d = json.load(f)
+print(d.get('suggested_checklist', ''))
+" 2>/dev/null || echo "")"
+  commands_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-issue-plan.json') as f:
+    d = json.load(f)
+print(d.get('first_commands', ''))
+" 2>/dev/null || echo "")"
+  issue_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-issue-plan.json') as f:
+    d = json.load(f)
+print(d.get('issue', ''))
+" 2>/dev/null || echo "")"
+
+  if [[ -z "$repo_val" || -z "$branch_val" || -z "$risk_val" || -z "$pr_title_val" || -z "$checklist_val" || -z "$commands_val" || -z "$issue_val" ]]; then
+    echo "[FAIL] CLI issue-plan missing required fields"
+    exit 1
+  fi
+
+  # Verify branch name format: issue-NNN-slug
+  if [[ ! "$branch_val" =~ ^issue-[0-9]{3}- ]]; then
+    echo "[FAIL] CLI issue-plan branch name does not match issue-NNN-* format: $branch_val"
+    exit 1
+  fi
+
+  # Verify risk is one of low, medium, high
+  if [[ "$risk_val" != "low" && "$risk_val" != "medium" && "$risk_val" != "high" ]]; then
+    echo "[FAIL] CLI issue-plan unexpected risk value: $risk_val"
+    exit 1
+  fi
+
+  # Verify suggested_pr_title starts with Resolve
+  if [[ ! "$pr_title_val" =~ ^Resolve ]]; then
+    echo "[FAIL] CLI issue-plan suggested_pr_title does not start with 'Resolve': $pr_title_val"
+    exit 1
+  fi
+
+  # Verify no shell metacharacters in first_commands suggest execution risk
+  for cmd in $(python3 -c "
+import json
+with open('/tmp/github-multitool-issue-plan.json') as f:
+    d = json.load(f)
+for c in d.get('first_commands', []):
+    print(c)
+"); do
+    if echo "$cmd" | grep -q '[;&|]'; then
+      echo "[FAIL] CLI issue-plan first_commands contain shell metacharacters: $cmd"
+      exit 1
+    fi
+  done
+
+  # Verify warnings is a list
+  warnings_type="$(python3 -c "
+import json
+with open('/tmp/github-multitool-issue-plan.json') as f:
+    d = json.load(f)
+print(type(d.get('warnings', [])).__name__)
+" 2>/dev/null || echo "")"
+  if [[ "$warnings_type" != "list" ]]; then
+    echo "[FAIL] CLI issue-plan warnings is not a list"
+    exit 1
+  fi
+
+  echo
+  echo "[PASS] CLI issue-plan (issue #$ISSUE_NUMBER, risk=$risk_val)"
+else
+  echo "No open issues found; skipping CLI issue-plan test."
+  echo "[PASS] CLI issue-plan (skipped - no open issues)"
+fi
+
+# -- Feature 9: Repo Visibility Guard smoke tests ----------------
+
+echo
+echo "== CLI repo-guard --help =="
+python3 tools/github-multitool/github_multitool.py repo-guard --help > /tmp/github-multitool-repo-guard-help.txt
+cat /tmp/github-multitool-repo-guard-help.txt
+echo
+echo "[PASS] CLI repo-guard --help"
+
+echo
+echo "== CLI repo-guard =="
+python3 tools/github-multitool/github_multitool.py repo-guard > /tmp/github-multitool-repo-guard.json
+cat /tmp/github-multitool-repo-guard.json
+
+# Validate repo-guard output shape
+ok_val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-repo-guard.json') as f:
+    d = json.load(f)
+print(d.get('ok', ''))
+" 2>/dev/null || echo "")"
+
+if [[ "$ok_val" != "True" ]]; then
+  echo "[FAIL] CLI repo-guard missing ok=true"
+  exit 1
+fi
+
+# Verify all required fields exist
+for field in repository visibility is_private write_tools_enabled block_writes_on_public_repo allow_public_repo_write_override write_tools_blocked warnings recommended_next_action; do
+  val="$(python3 -c "
+import json
+with open('/tmp/github-multitool-repo-guard.json') as f:
+    d = json.load(f)
+print(d.get('$field', '__MISSING__'))
+" 2>/dev/null || echo "__MISSING__")"
+  if [[ "$val" == "__MISSING__" ]]; then
+    echo "[FAIL] CLI repo-guard missing field: $field"
+    exit 1
+  fi
+done
+
+# Validate the repo is public and writes are blocked (known state for this repo)
+is_private="$(python3 -c "
+import json
+with open('/tmp/github-multitool-repo-guard.json') as f:
+    d = json.load(f)
+print(d.get('is_private', ''))
+" 2>/dev/null || echo "")"
+visibility="$(python3 -c "
+import json
+with open('/tmp/github-multitool-repo-guard.json') as f:
+    d = json.load(f)
+print(d.get('visibility', ''))
+" 2>/dev/null || echo "")"
+blocked="$(python3 -c "
+import json
+with open('/tmp/github-multitool-repo-guard.json') as f:
+    d = json.load(f)
+print(d.get('write_tools_blocked', ''))
+" 2>/dev/null || echo "")"
+warnings_count="$(python3 -c "
+import json
+with open('/tmp/github-multitool-repo-guard.json') as f:
+    d = json.load(f)
+print(len(d.get('warnings', [])))
+" 2>/dev/null || echo "0")"
+
+if [[ "$is_private" != "False" ]]; then
+  echo "[FAIL] CLI repo-guard expected is_private=False, got: $is_private"
+  exit 1
+fi
+if [[ "$visibility" != "PUBLIC" ]]; then
+  echo "[FAIL] CLI repo-guard expected visibility=PUBLIC, got: $visibility"
+  exit 1
+fi
+if [[ "$blocked" != "True" ]]; then
+  echo "[FAIL] CLI repo-guard expected write_tools_blocked=True, got: $blocked"
+  exit 1
+fi
+if [[ "$warnings_count" -lt 1 ]]; then
+  echo "[FAIL] CLI repo-guard expected at least 1 warning, got: $warnings_count"
+  exit 1
+fi
+
+echo
+echo "[PASS] CLI repo-guard (public repo, writes blocked as expected)"
+
+
 echo "== Final result =="
 echo "[PASS] GitHub multitool smoke test completed successfully."
