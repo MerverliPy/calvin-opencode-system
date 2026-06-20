@@ -35,3 +35,14 @@ Never run without explicit approval:
 - curl | sh
 - wget | sh
 - credential or token exfiltration commands
+
+## Termius / iPhone Safety
+
+When the user is working from Termius on iPhone:
+
+- prefer small command blocks
+- avoid large pasted multi-step scripts
+- prefer saved scripts in `/tmp` for complex operations
+- checkpoint with `git status --short --branch`
+- avoid clipboard and Windows GUI assumptions
+- stop after failures and inspect before rerunning

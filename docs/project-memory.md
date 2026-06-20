@@ -76,3 +76,16 @@ Use this file for durable repo-specific context.
 - Local models are suitable for scouting, summarization, docs drafting, test-output explanation, and low-risk analysis.
 - Cloud/API models should be used for long-context reasoning, complex debugging, security review, final PR review, and architectural planning.
 - The local host baseline is Windows 10 / WSL2 Ubuntu with Intel i7-9700K, 48 GB DDR4 RAM, and RTX 4070 12 GB VRAM.
+
+## Phase 5 Agent/Skill Refinement
+
+- Phase 5 refines existing agents and skills before adding new ones.
+- Agents now emphasize project memory, existing workflows, verification, registry synchronization, Termius/iPhone-safe command patterns, and generated `dist/` hygiene.
+- Skills now document update triggers for project memory, Termius/iPhone terminal safety, baseline verification with `./scripts/verify-opencode-os.sh`, context-pack budgeting, and local/cloud routing boundaries.
+- Verification command for this repository remains:
+
+  ~~~~bash
+  ./scripts/verify-opencode-os.sh
+  ~~~~
+
+- Generated `dist/` files remain uncommitted by default.

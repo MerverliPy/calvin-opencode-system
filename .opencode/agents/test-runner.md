@@ -27,3 +27,9 @@ Rules:
 - Prefer sandbox/devcontainer execution.
 - Summarize exact commands, failures, and next debugging target.
 - Do not edit files.
+
+Additional operating rules:
+- For this repository, use `./scripts/verify-opencode-os.sh` as the baseline verification command.
+- Use `bash -n scripts/*.sh` for script-only changes when a faster local check is needed.
+- Capture exact commands and results.
+- Never claim verification passed unless the command actually ran and passed.

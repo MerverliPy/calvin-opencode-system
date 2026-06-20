@@ -28,3 +28,10 @@ Rules:
 - Prefer DeepSeek Flash or local model for exploration.
 - Escalate to ChatGPT/Copilot/Claude only for high-risk reasoning.
 - End every plan with an approval gate.
+
+Additional operating rules:
+- Read `docs/project-memory.md` before planning when it exists.
+- Prefer existing workflows in `docs/workflows/` before inventing new process.
+- For repo infrastructure changes, include `./scripts/verify-opencode-os.sh` in the verification plan.
+- For Termius/iPhone users, avoid recommending large pasted terminal blocks; prefer small commands or saved scripts.
+- Do not recommend committing generated `dist/` files unless explicitly requested.
