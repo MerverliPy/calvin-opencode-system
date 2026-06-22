@@ -206,3 +206,41 @@ Use this file for durable repo-specific context.
 - Read-only commands continue to work on public repos.
 - Visibility guard is an additional gate on top of `allow_write_tools`, not a replacement.
 - Public repo write override is marked as advanced/risky.
+
+## Feature 10: Security Alerts Summary
+
+- Added `security-summary` CLI command and `GET /security/summary` server endpoint.
+- Summarizes GitHub security posture from read-only commands: repository visibility, default branch, branch protection status, open Dependabot alerts, open code scanning alerts, open secret scanning alerts, security workflow presence, recent security-related PRs, and risk summary.
+- Uses `gh api` for security endpoints (`dependabot/alerts`, `code-scanning/alerts`, `secret-scanning/alerts`, `branches/.../protection`).
+- Handles 401, 403, 404 from GitHub API gracefully — reports `unavailable` rather than crashing.
+- 404 for branch protection → `protected: false`, status `not_protected_or_unavailable`.
+- Secret scanning: only count/status/type metadata reported; never requests or prints secret values.
+- Security workflows detected from local `.github/workflows/` files by scanning filenames and content for security-related keywords (security, codeql, dependabot, secret, scan, audit, vulnerability).
+- Recent security PRs detected by filtering `gh pr list` titles, labels, and branch names for security-related terms.
+- Risk levels: high (public + open secret/code scanning alerts), medium (public, no branch protection, APIs unavailable, no security workflows), low (private, protected, no alerts, workflows present), unknown (most checks unavailable).
+- Unavailable data is reported as `unavailable` rather than treated as zero alerts, preventing false sense of security.
+- Returns stable JSON output with `ok`, `repository`, `visibility`, `default_branch`, `branch_protection`, `alerts`, `security_workflows`, `recent_security_prs`, and `risk_summary`.
+- Read-only: uses `gh repo view`, `gh api`, `gh pr list`, and local file reads.
+- Smoke test validates output shape even when alert APIs are unavailable.
+- Does not mutate GitHub.
+
+## Feature 11: Branch Protection Inspector
+
+- Added `branch-protection` CLI command and `GET /branch/<name>/protection` server endpoint.
+- Inspects branch protection rules for any named branch via `gh api repos/.../branches/.../protection`.
+- Returns stable JSON with all protection fields normalized (14 fields) regardless of API response.
+- Handles 404 (no protection → `protected: false`, `raw_availability: not_protected_or_unavailable`) and 403 (permission denied → `protected: null`, `raw_availability: permission_denied_or_unavailable`) gracefully.
+- Read-only: does not create, modify, or delete branch protection rules.
+- Does not print tokens, credentials, or secret values.
+
+## Feature 12: Terminal UI Dashboard
+
+- Added `dashboard` CLI command — compact overview optimized for Termius/iPhone.
+- Default output is narrow human-readable text with repository, visibility, default branch, open PR/issue counts, failed run count, branch protection status, security alert availability/count, repo guard summary, and prioritized recommended next action.
+- `--json` flag produces stable JSON for agent/script consumption with fields: `ok`, `repository`, `visibility`, `default_branch`, `open_prs`, `open_issues`, `failed_runs`, `branch_protection`, `security_summary`, `repo_guard`, `recommended_next_action`, `warnings`.
+- Aggregation helper `_aggregate_dashboard_data` reuses existing helpers: `_check_branch_protection` (Feature 10), `_check_alert_endpoint` (Feature 10), `_get_default_branch` (Feature 7).
+- Handles missing permissions gracefully — reports `unavailable` rather than crashing when backend calls fail.
+- Recommended next action priority: (1) public repo warning, (2) failed runs, (3) missing branch protection, (4) unavailable security APIs, (5) open alerts, (6) open PRs, (7) no active work.
+- Strictly read-only: uses `gh repo view`, `gh pr list`, `gh issue list`, `gh run list`, `gh api`.
+- Uses subprocess argument lists; never `shell=True`.
+- Does not print tokens, credentials, or secret values.
