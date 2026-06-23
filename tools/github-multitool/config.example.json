@@ -22,5 +22,7 @@
     "exfiltrate-secret"
   ],
   "warn_public_repositories": true,
-  "strict_private": false
+  "strict_private": false,
+  "block_writes_on_public_repo": true,
+  "allow_public_repo_write_override": false
 }

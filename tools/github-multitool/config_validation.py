@@ -73,6 +73,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     require_bool(validated, "allow_write_tools", False)
     require_bool(validated, "warn_public_repositories", True)
     require_bool(validated, "strict_private", False)
+    require_bool(validated, "block_writes_on_public_repo", True)
+    require_bool(validated, "allow_public_repo_write_override", False)
 
     require_string_list(validated, "require_confirmation_for")
     require_string_list(validated, "forbidden_actions")

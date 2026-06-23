@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,8 @@ DEFAULT_CONFIG = {
     "allow_write_tools": False,
     "warn_public_repositories": True,
     "strict_private": False,
+    "block_writes_on_public_repo": True,
+    "allow_public_repo_write_override": False,
 }
 
 
@@ -94,6 +98,102 @@ def resolve_repo(config: dict[str, Any], requested_repo: str | None) -> str:
     return repo
 
 
+
+
+
+# ---------------------------------------------------------------------------
+# Write tool safety gates (Feature 5: Safe PR Creator)
+# ---------------------------------------------------------------------------
+
+
+def _check_allow_write_tools(config: dict[str, Any]) -> None:
+    """Raise ToolError if write tools are disabled in config."""
+    if not config.get("allow_write_tools", False):
+        raise ToolError(
+            "Write tools are disabled. "
+            "Set allow_write_tools=true in config to enable gated write commands."
+        )
+
+
+
+def _repo_visibility_blocks_writes(config: dict[str, Any], repo: str) -> bool:
+    """Check if the repo visibility guard blocks write operations.
+
+    Returns True when: repo is public, block_writes_on_public_repo is True,
+    and allow_public_repo_write_override is False.
+    """
+    block_on_public = bool(config.get("block_writes_on_public_repo", True))
+    allow_override = bool(config.get("allow_public_repo_write_override", False))
+
+    # If block_on_public is false or override is true, don't block
+    if not block_on_public or allow_override:
+        return False
+
+    # Check actual repo visibility
+    try:
+        vis_data = run_gh_json([
+            "repo", "view", repo,
+            "--json", "visibility,isPrivate",
+        ])
+    except ToolError:
+        return False
+
+    is_private = vis_data.get("isPrivate", None)
+    visibility = (vis_data.get("visibility") or "").upper()
+    is_public = is_private is False or visibility == "PUBLIC"
+
+    return is_public
+
+
+def _git_working_tree_clean() -> bool:
+    """Return True if git working tree is clean (no uncommitted changes)."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0 and result.stdout.strip() == ""
+
+
+def _git_current_branch() -> str:
+    """Return the current git branch name."""
+    result = subprocess.run(
+        ["git", "branch", "--show-current"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ToolError(
+            "Failed to determine current branch: "
+            + (result.stderr.strip() or "not in a git repository")
+        )
+    return result.stdout.strip()
+
+
+def _branch_ahead_count(base: str, head: str) -> int:
+    """Return number of commits *head* is ahead of *base*.
+
+    Prefers origin/<base> when available, falls back to local <base>.
+    """
+    for base_ref in (f"origin/{base}", base):
+        result = subprocess.run(
+            ["git", "rev-list", "--count", f"{base_ref}..{head}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            try:
+                return int(result.stdout.strip())
+            except ValueError:
+                continue
+    raise ToolError(
+        f"Failed to count commits ahead: could not compare {base}..{head}"
+    )
+
+
 def run_gh_json(args: list[str]) -> Any:
     require_gh()
 
@@ -118,6 +218,720 @@ def run_gh_json(args: list[str]) -> Any:
         raise ToolError(f"Expected JSON from gh, got non-JSON output: {exc}") from exc
 
 
+# ---------------------------------------------------------------------------
+# PR Readiness Score helpers
+# ---------------------------------------------------------------------------
+
+HIGH_RISK_DIRS = [
+    ".github/workflows/",
+    "tools/github-multitool/",
+    "scripts/",
+    ".opencode/",
+]
+
+HIGH_RISK_FILES = {
+    "package-lock.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "dockerfile",
+    "docker-compose.yml",
+}
+
+HIGH_RISK_KEYWORDS = [
+    "secret", "token", "credential", "auth",
+    "deploy", "release", "workflow",
+]
+
+STALE_DAYS = 14
+
+
+
+# ---------------------------------------------------------------------------
+# Log redaction and failure classification helpers
+# ---------------------------------------------------------------------------
+
+SENSITIVE_LOG_PATTERNS = [
+    "gh_token",
+    "github_token",
+    "token",
+    "secret",
+    "credential",
+    "password",
+    "cookie",
+    "authorization",
+    "bearer",
+]
+
+
+def _redact_log(log_text: str) -> str:
+    """Redact sensitive-looking log lines before printing or storing."""
+    lines = log_text.split("\n")
+    redacted: list[str] = []
+    for line in lines:
+        lower = line.lower()
+        if any(p in lower for p in SENSITIVE_LOG_PATTERNS):
+            redacted.append("[REDACTED: line matched sensitive pattern]")
+        else:
+            redacted.append(line)
+    return "\n".join(redacted)
+
+
+def _classify_failure(log_text: str) -> dict[str, str]:
+    """Lightweight pattern matching to classify a workflow failure from log text.
+
+    Returns a dict with keys: class, recommended_command, next_step.
+    """
+    lower = log_text.lower()
+
+    # Shell syntax errors (check first — most specific patterns)
+    shell_patterns = [
+        "syntax error", "unexpected token", "command not found",
+        "bad substitution",
+    ]
+    if any(p in lower for p in shell_patterns):
+        return {
+            "class": "shell syntax",
+            "recommended_command": "bash -n <script>",
+            "next_step": "Run bash -n on the failing script to catch syntax errors locally.",
+        }
+
+    # Test failures
+    test_patterns = [
+        "assertionerror", " assertionerror", "pytest", "npm test",
+        "test failed", "test failure",
+    ]
+    # also match FAILED in all-caps (common pytest output) but not the word "failed" alone
+    has_failed_caps = any("FAILED" in part for part in log_text.split("\n") if "FAILED" in part)
+    if any(p in lower for p in test_patterns) or has_failed_caps:
+        return {
+            "class": "test failure",
+            "recommended_command": "tools/github-multitool/smoke-test.sh",
+            "next_step": "Run the matching local verification command and inspect the first failing test.",
+        }
+
+    # Dependency install failures
+    dep_patterns = [
+        "npm err!", "pip install", "no matching distribution found",
+        "could not resolve", "dependency",
+    ]
+    if any(p in lower for p in dep_patterns):
+        return {
+            "class": "dependency install",
+            "recommended_command": "pip install -r requirements.txt  # or npm install",
+            "next_step": "Check that dependency versions are available and compatible with the runner environment.",
+        }
+
+    # Permission / token failures
+    perm_patterns = [
+        "permission denied", "resource not accessible by integration",
+        "bad credentials", "gh_token", "github_token", " 403 ", " 401 ",
+    ]
+    if any(p in lower for p in perm_patterns):
+        return {
+            "class": "permission/token",
+            "recommended_command": "gh auth status",
+            "next_step": "Verify GITHUB_TOKEN permissions and repository secrets configuration.",
+        }
+
+    # Workflow configuration errors
+    wf_patterns = [
+        "invalid workflow file", "the workflow is not valid",
+        ".github/workflows", "mapping values are not allowed",
+    ]
+    if any(p in lower for p in wf_patterns):
+        return {
+            "class": "workflow configuration",
+            "recommended_command": "yamllint .github/workflows/  # or python3 -c 'import yaml; yaml.safe_load(open(\"...\"))'",
+            "next_step": "Validate the workflow YAML file syntax and structure.",
+        }
+
+    # Unknown
+    return {
+        "class": "unknown",
+        "recommended_command": "tools/github-multitool/smoke-test.sh",
+        "next_step": "Inspect failed job logs with run-explain.",
+    }
+
+
+def _fetch_failed_run_log(repo: str, run_id: int, max_lines: int = 200) -> str:
+    """Fetch a limited log excerpt from a failed run's failed steps.
+
+    Uses gh run view --log-failed and returns at most *max_lines*.
+    Returns an empty string if the log is unavailable.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "run", "view", str(run_id), "--repo", repo, "--log-failed"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=45,
+        )
+    except subprocess.TimeoutExpired:
+        return "(log fetch timed out)"
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if stderr:
+            return f"(log unavailable: {stderr})"
+        return ""
+
+    raw = result.stdout.strip()
+    if not raw:
+        return ""
+
+    lines = raw.split("\n")
+    if len(lines) > max_lines:
+        excerpt = "\n".join(lines[:max_lines])
+        excerpt += f"\n... (truncated, {len(lines) - max_lines} more lines)"
+    else:
+        excerpt = raw
+
+    return _redact_log(excerpt)
+
+def _is_high_risk_file(filepath: str) -> bool:
+    """Return True if *filepath* matches high-risk directory, file, or keyword."""
+    path_lower = filepath.lower()
+
+    for d in HIGH_RISK_DIRS:
+        if path_lower.startswith(d):
+            return True
+
+    filename = path_lower.split("/")[-1]
+    if filename in HIGH_RISK_FILES:
+        return True
+
+    for kw in HIGH_RISK_KEYWORDS:
+        if kw in path_lower:
+            return True
+
+    return False
+
+
+def _fetch_pr_metadata(repo: str, number: int) -> dict[str, Any]:
+    """Fetch PR metadata via gh pr view --json."""
+    return run_gh_json([
+        "pr", "view", str(number),
+        "--repo", repo,
+        "--json",
+        "number,title,state,isDraft,author,headRefName,baseRefName,"
+        "mergeStateStatus,reviewDecision,url,updatedAt,createdAt",
+    ])
+
+
+def _fetch_changed_files(repo: str, number: int) -> list[str]:
+    """Fetch changed file paths for a PR via gh pr view --json files."""
+    try:
+        result = run_gh_json([
+            "pr", "view", str(number),
+            "--repo", repo,
+            "--json", "files",
+        ])
+    except ToolError:
+        return []
+
+    files = result.get("files") if isinstance(result, dict) else result
+    if not isinstance(files, list):
+        return []
+    return [f.get("path", "") for f in files if isinstance(f, dict)]
+
+
+def _fetch_pr_checks(repo: str, number: int) -> list[dict[str, Any]]:
+    """Fetch PR check statuses via gh pr checks --json."""
+    try:
+        result = run_gh_json([
+            "pr", "checks", str(number),
+            "--repo", repo,
+            "--json", "name,status,conclusion",
+        ])
+    except ToolError:
+        return []
+    return result if isinstance(result, list) else []
+
+
+def _score_pr_readiness(
+    pr_data: dict[str, Any],
+    files: list[str],
+    checks_data: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compute a numeric readiness score (0-100) and risk level."""
+
+    score: int = 100
+    blockers: list[str] = []
+    warnings: list[str] = []
+    reasons: list[dict[str, Any]] = []
+
+    number = pr_data.get("number")
+
+    # ── Merge state ───────────────────────────────────────────────
+    mss = (pr_data.get("mergeStateStatus") or "").upper()
+    if mss == "CLEAN":
+        reasons.append({"signal": "merge_state_clean", "effect": 0,
+                        "detail": "Merge state is clean"})
+    elif mss == "DIRTY":
+        score -= 30
+        blockers.append("Merge conflicts detected")
+        reasons.append({"signal": "merge_state_dirty", "effect": -30,
+                        "detail": "Merge state is dirty (conflicts)"})
+    elif mss == "BLOCKED":
+        score -= 30
+        blockers.append("Merge is blocked")
+        reasons.append({"signal": "merge_state_blocked", "effect": -30,
+                        "detail": "Merge is blocked"})
+    elif mss in ("UNKNOWN", ""):
+        score -= 10
+        warnings.append("Merge state is unknown")
+        reasons.append({"signal": "merge_state_unknown", "effect": -10,
+                        "detail": "Merge state is unknown"})
+    else:
+        score -= 10
+        warnings.append(f"Unexpected merge state: {mss}")
+        reasons.append({"signal": "merge_state_unexpected", "effect": -10,
+                        "detail": f"Unexpected merge state: {mss}"})
+
+    # ── Draft ─────────────────────────────────────────────────────
+    if pr_data.get("isDraft"):
+        score -= 30
+        blockers.append("PR is a draft")
+        reasons.append({"signal": "draft", "effect": -30,
+                        "detail": "Draft PRs are not ready for review"})
+    else:
+        reasons.append({"signal": "not_draft", "effect": 0,
+                        "detail": "PR is not a draft"})
+
+    # ── Stale ─────────────────────────────────────────────────────
+    updated_at = pr_data.get("updatedAt", "")
+    if updated_at:
+        try:
+            updated_dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - updated_dt).days
+            if age_days > STALE_DAYS:
+                score -= 10
+                warnings.append(f"PR is stale ({age_days} days since last update)")
+                reasons.append({"signal": "stale_pr", "effect": -10,
+                                "detail": f"PR has not been updated in {age_days} days"})
+        except (ValueError, TypeError):
+            pass
+
+    # ── Review decision ───────────────────────────────────────────
+    rd = (pr_data.get("reviewDecision") or "").upper()
+    if rd == "APPROVED":
+        reasons.append({"signal": "review_approved", "effect": 0,
+                        "detail": "Review has been approved"})
+    elif rd == "CHANGES_REQUESTED":
+        score -= 15
+        blockers.append("Changes requested in review")
+        reasons.append({"signal": "review_changes_requested", "effect": -15,
+                        "detail": "Review requested changes"})
+    elif rd in ("REVIEW_REQUIRED", ""):
+        score -= 5
+        warnings.append("Review decision unavailable")
+        reasons.append({"signal": "review_unavailable", "effect": -5,
+                        "detail": "Review decision is not available"})
+    else:
+        score -= 5
+        warnings.append(f"Unknown review decision: {rd}")
+        reasons.append({"signal": "review_unknown", "effect": -5,
+                        "detail": f"Unknown review decision: {rd}"})
+
+    # ── Base branch ───────────────────────────────────────────────
+    base_ref = pr_data.get("baseRefName", "")
+    if base_ref == "main":
+        reasons.append({"signal": "base_is_main", "effect": 0,
+                        "detail": "Base branch is main"})
+    else:
+        score -= 5
+        warnings.append(f"Base branch is '{base_ref}', not main")
+        reasons.append({"signal": "base_not_main", "effect": -5,
+                        "detail": f"Base branch is '{base_ref}', not main"})
+
+    # ── Checks ────────────────────────────────────────────────────
+    if checks_data:
+        failed = [c for c in checks_data if c.get("conclusion") == "FAILURE"]
+        pending = [c for c in checks_data
+                   if c.get("status") in ("IN_PROGRESS", "QUEUED")]
+
+        if failed:
+            score -= max(20, len(failed) * 5)  # significant penalty
+            blockers.append(f"{len(failed)} check(s) failed")
+            reasons.append({"signal": "checks_failed",
+                            "effect": -max(20, len(failed) * 5),
+                            "detail": f"{len(failed)} checks failed",
+                            "failed_checks": [c.get("name") for c in failed]})
+        elif pending:
+            score -= 5
+            warnings.append(f"{len(pending)} check(s) still running")
+            reasons.append({"signal": "checks_pending", "effect": -5,
+                            "detail": f"{len(pending)} checks pending"})
+        else:
+            reasons.append({"signal": "checks_passed", "effect": 0,
+                            "detail": "All checks passed or neutral"})
+    else:
+        score -= 5
+        warnings.append("Check status unavailable")
+        reasons.append({"signal": "checks_unavailable", "effect": -5,
+                        "detail": "Check status could not be fetched"})
+
+    # ── High-risk files ───────────────────────────────────────────
+    if files:
+        risky = [f for f in files if _is_high_risk_file(f)]
+        if risky:
+            # cap combined file-risk deduction at 30
+            risk_deduction = min(30, len(risky) * 10)
+            score -= risk_deduction
+            if risk_deduction >= 20:
+                blockers.append(f"{len(risky)} high-risk file(s) changed")
+            else:
+                warnings.append(f"{len(risky)} high-risk file(s) changed")
+            reasons.append({
+                "signal": "high_risk_files",
+                "effect": -risk_deduction,
+                "detail": f"{len(risky)} high-risk files changed",
+                "files": risky,
+            })
+        else:
+            reasons.append({"signal": "no_risky_files", "effect": 0,
+                            "detail": "No high-risk files changed"})
+    else:
+        warnings.append("Changed files unavailable")
+        reasons.append({"signal": "files_unavailable", "effect": 0,
+                        "detail": "Changed files could not be fetched"})
+
+    # ── Clamp & risk level ────────────────────────────────────────
+    score = max(0, min(100, score))
+
+    if score >= 85:
+        risk = "low"
+    elif score >= 60:
+        risk = "medium"
+    elif score >= 30:
+        risk = "high"
+    else:
+        risk = "blocked"
+
+    # ── Recommended next action ───────────────────────────────────
+    if blockers:
+        recommended = "Address blockers before proceeding."
+    elif warnings:
+        recommended = "Run local verification and request review."
+    elif score >= 85:
+        recommended = "PR appears ready to merge."
+    else:
+        recommended = "Review and address warnings before proceeding."
+
+    return {
+        "number": number,
+        "score": score,
+        "risk": risk,
+        "blockers": blockers,
+        "warnings": warnings,
+        "scoring_reasons": reasons,
+        "changed_files": files,
+        "recommended_next_action": recommended,
+    }
+
+
+
+
+def _parse_diff_stats(diff_text: str) -> dict[str, int]:
+    """Parse gh pr diff output to count files, additions, deletions."""
+    files = 0
+    additions = 0
+    deletions = 0
+    for line in diff_text.split("\n"):
+        if line.startswith("diff --git"):
+            files += 1
+        elif line.startswith("+") and not line.startswith("+++"):
+            additions += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            deletions += 1
+    return {"files": files, "additions": additions, "deletions": deletions}
+
+
+def _fetch_pr_diff(repo: str, number: int) -> str:
+    """Fetch a compact diff for a PR via gh pr diff (read-only)."""
+    result = subprocess.run(
+        ["gh", "pr", "diff", str(number), "--repo", repo, "--color", "never"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _sanitize_for_appendix(data: dict[str, Any]) -> dict[str, Any]:
+    """Remove sensitive fields from metadata for appendix inclusion."""
+    safe = dict(data)
+    sensitive_patterns = {"token", "password", "secret", "credential", "cookie", "key", "auth"}
+    for key in list(safe.keys()):
+        key_lower = key.lower()
+        for pattern in sensitive_patterns:
+            if pattern in key_lower:
+                safe[key] = "***REDACTED***"
+    return safe
+
+
+def _build_review_pack_md(
+    pr_data: dict[str, Any],
+    readiness: dict[str, Any],
+    files: list[str],
+    diff_text: str,
+    number: int,
+    padded: str,
+    repo: str,
+) -> str:
+    """Build the Markdown review pack content."""
+    lines: list[str] = []
+
+    author_data = pr_data.get("author") or {}
+    author = author_data.get("login", "unknown") if isinstance(author_data, dict) else str(author_data)
+
+    diff_stats = _parse_diff_stats(diff_text) if diff_text else {"files": 0, "additions": 0, "deletions": 0}
+
+    # ── Header ──
+    lines.append(f"# PR {number} Review Pack")
+    lines.append("")
+
+    # ── Summary ──
+    lines.append("## Summary")
+    lines.append("")
+    lines.append(f"- **Title**: {pr_data.get('title', 'N/A')}")
+    lines.append(f"- **Author**: {author}")
+    lines.append(f"- **Branch**: `{pr_data.get('headRefName', 'N/A')}` → `{pr_data.get('baseRefName', 'N/A')}`")
+    lines.append(f"- **Base Branch**: `{pr_data.get('baseRefName', 'N/A')}`")
+    lines.append(f"- **URL**: {pr_data.get('url', 'N/A')}")
+    lines.append(f"- **State**: {pr_data.get('state', 'N/A')}")
+    lines.append(f"- **Draft**: {pr_data.get('isDraft', False)}")
+    lines.append(f"- **Updated**: {pr_data.get('updatedAt', 'N/A')}")
+    lines.append("")
+
+    # ── Readiness ──
+    lines.append("## Readiness")
+    lines.append("")
+    lines.append(f"- **Score**: {readiness['score']}/100")
+    lines.append(f"- **Risk**: {readiness['risk']}")
+    blockers = readiness.get("blockers", [])
+    if blockers:
+        lines.append(f"- **Blockers**: {len(blockers)}")
+        for b in blockers:
+            lines.append(f"  - {b}")
+    else:
+        lines.append("- **Blockers**: none")
+    warnings = readiness.get("warnings", [])
+    if warnings:
+        lines.append(f"- **Warnings**: {len(warnings)}")
+        for w in warnings:
+            lines.append(f"  - {w}")
+    else:
+        lines.append("- **Warnings**: none")
+    lines.append(f"- **Recommended Next Action**: {readiness.get('recommended_next_action', 'N/A')}")
+    lines.append("")
+
+    # ── Changed Files ──
+    lines.append("## Changed Files")
+    lines.append("")
+    if files:
+        for fp in files:
+            flag = "  ⚠️ HIGH RISK" if _is_high_risk_file(fp) else ""
+            lines.append(f"- `{fp}`{flag}")
+    else:
+        lines.append("_No changed files available._")
+    lines.append("")
+
+    # ── Diff Summary ──
+    lines.append("## Diff Summary")
+    lines.append("")
+    if diff_text:
+        lines.append(f"- **Files changed**: {diff_stats['files']}")
+        lines.append(f"- **Additions**: {diff_stats['additions']}")
+        lines.append(f"- **Deletions**: {diff_stats['deletions']}")
+        lines.append("")
+        lines.append("```diff")
+        diff_lines = diff_text.split("\n")
+        max_diff = 150
+        if len(diff_lines) <= max_diff:
+            lines.append(diff_text)
+        else:
+            lines.append("\n".join(diff_lines[:max_diff]))
+            lines.append(f"")
+            lines.append(f"... ({len(diff_lines) - max_diff} more lines truncated)")
+        lines.append("```")
+    else:
+        lines.append("_Diff not available._")
+    lines.append("")
+
+    # ── Risk Assessment ──
+    lines.append("## Risk Assessment")
+    lines.append("")
+    high_risk_files = [fp for fp in files if _is_high_risk_file(fp)]
+    if readiness["risk"] == "low":
+        lines.append("This PR appears low-risk. No significant blockers or high-risk file changes detected.")
+    elif readiness["risk"] == "medium":
+        lines.append("This PR has moderate risk. Review the warnings below and verify changed files before merging.")
+    elif readiness["risk"] == "high":
+        lines.append("**⚠️ This PR has high risk.** Review carefully before merging.")
+    else:
+        lines.append("**🚫 This PR is blocked.** Address blockers before any review or merge attempt.")
+    lines.append("")
+
+    if high_risk_files:
+        lines.append("### High-Risk Files Changed")
+        lines.append("")
+        lines.append("The following files match high-risk patterns and deserve extra scrutiny:")
+        lines.append("")
+        for f in high_risk_files:
+            lines.append(f"- `{f}`")
+        lines.append("")
+
+    # Specific risk notes based on signals
+    scoring = readiness.get("scoring_reasons", [])
+    negative_signals = [s for s in scoring if s.get("effect", 0) < 0]
+    if negative_signals:
+        lines.append("### Risk Signals")
+        lines.append("")
+        for s in negative_signals:
+            lines.append(f"- **{s.get('signal', 'unknown')}** (effect: {s.get('effect', 0)}): {s.get('detail', '')}")
+        lines.append("")
+
+    lines.append("")
+
+    # ── Verification Commands ──
+    lines.append("## Verification Commands")
+    lines.append("")
+    lines.append("Run the following commands to verify the repository state:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append("tools/github-multitool/smoke-test.sh")
+    lines.append("./scripts/verify-opencode-os.sh")
+    lines.append("git status --short --branch")
+    lines.append("```")
+    lines.append("")
+
+    # ── Rollback Notes ──
+    lines.append("## Rollback Notes")
+    lines.append("")
+    head_branch = pr_data.get("headRefName", "feature-branch")
+    base_branch = pr_data.get("baseRefName", "main")
+    lines.append("To abandon this branch locally before merge:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append(f"git checkout {base_branch}")
+    lines.append(f"git branch -D {head_branch}")
+    lines.append("```")
+    lines.append("")
+    lines.append("If the PR has already been merged and needs reversion:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append("git revert <merge-commit-hash>")
+    lines.append("```")
+    lines.append("")
+
+    # ── ChatGPT / opencode Review Prompt ──
+    lines.append("## ChatGPT / opencode Review Prompt")
+    lines.append("")
+    lines.append("Copy and paste the following prompt into ChatGPT, opencode, or another review tool:")
+    lines.append("")
+    lines.append("```")
+    lines.append(f"Please review PR #{number} ({pr_data.get('title', 'N/A')}) in the {repo} repository.")
+    lines.append("")
+    lines.append("Review checklist:")
+    lines.append("1. **Correctness** — Does the logic accomplish the intended goal without bugs or unintended side effects?")
+    lines.append("2. **Safety** — Are there security risks, token leaks, injection vectors, or unsafe command patterns?")
+    lines.append("3. **Regression risk** — Could this change break existing features, workflows, or smoke tests?")
+    lines.append("4. **Missing verification** — What tests, assertions, or manual checks should be added?")
+    lines.append("5. **Suggested improvements** — What could be simpler, cleaner, or more maintainable?")
+    lines.append("")
+    lines.append("The diff summary and changed files are included in this review pack.")
+    lines.append("Focus on the risk assessment signals first.")
+    lines.append("```")
+    lines.append("")
+
+    # ── Raw Metadata Appendix ──
+    lines.append("## Raw Metadata Appendix")
+    lines.append("")
+    lines.append("```json")
+    appendix = {
+        "pr_metadata": _sanitize_for_appendix(pr_data),
+        "readiness": {
+            "score": readiness["score"],
+            "risk": readiness["risk"],
+            "blockers": readiness.get("blockers", []),
+            "warnings": readiness.get("warnings", []),
+            "recommended_next_action": readiness.get("recommended_next_action"),
+        },
+        "changed_files": files,
+        "diff_stats": diff_stats,
+        "high_risk_files": high_risk_files,
+    }
+    lines.append(json.dumps(appendix, indent=2, sort_keys=True))
+    lines.append("```")
+    lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# ── CLI command: pr-review-pack ─────────────────────────────────────────────
+
+
+def cmd_pr_review_pack(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Generate a local Markdown review package for a PR."""
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+    number: int = args.number
+
+    # Fetch PR metadata (required)
+    try:
+        pr_data = _fetch_pr_metadata(repo, number)
+    except ToolError as exc:
+        print_json({"ok": False, "error": f"Failed to fetch PR metadata: {exc}"})
+        return 2
+
+    # Fetch changed files (best-effort)
+    try:
+        files = _fetch_changed_files(repo, number)
+    except ToolError as exc:
+        files = []
+
+    # Fetch checks (best-effort)
+    try:
+        checks = _fetch_pr_checks(repo, number)
+    except ToolError as exc:
+        checks = []
+
+    # Compute readiness score
+    readiness = _score_pr_readiness(pr_data, files, checks)
+
+    # Fetch compact diff (read-only, best-effort)
+    diff_text = _fetch_pr_diff(repo, number)
+
+    # Generate output path
+    output_dir = repo_root() / "dist" / "github-review-packs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    padded = f"{number:03d}"
+    output_path = output_dir / f"pr-{padded}-review-pack.md"
+
+    # Build and write Markdown review pack
+    md_content = _build_review_pack_md(pr_data, readiness, files, diff_text, number, padded, repo)
+    output_path.write_text(md_content, encoding="utf-8")
+
+    # Print JSON result
+    result = {
+        "ok": True,
+        "pr_number": number,
+        "output_path": str(output_path),
+        "repository": repo,
+        "readiness_score": readiness["score"],
+        "risk": readiness["risk"],
+        "changed_file_count": len(files),
+    }
+    print_json(result)
+    return 0
+
+# ---------------------------------------------------------------------------
+# CLI commands
+# ---------------------------------------------------------------------------
+
+
 def cmd_health(config: dict[str, Any], args: argparse.Namespace) -> int:
     payload = {
         "ok": True,
@@ -128,6 +942,8 @@ def cmd_health(config: dict[str, Any], args: argparse.Namespace) -> int:
         "allow_write_tools": bool(config.get("allow_write_tools", False)),
         "warn_public_repositories": bool(config.get("warn_public_repositories", True)),
         "strict_private": bool(config.get("strict_private", False)),
+        "block_writes_on_public_repo": bool(config.get("block_writes_on_public_repo", True)),
+        "allow_public_repo_write_override": bool(config.get("allow_public_repo_write_override", False)),
         "default_repository": config.get("default_repository"),
         "allowed_repositories": config.get("allowed_repositories", []),
     }
@@ -154,6 +970,74 @@ def cmd_repo_status(config: dict[str, Any], args: argparse.Namespace) -> int:
         payload["safety_warnings"] = warnings
 
     print_json(payload)
+    return 0
+
+
+def cmd_repo_guard(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Check repository visibility and enforce write protection on public repos."""
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+
+    # Fetch visibility
+    try:
+        vis_data = run_gh_json([
+            "repo", "view", repo,
+            "--json", "nameWithOwner,visibility,isPrivate",
+        ])
+    except ToolError as exc:
+        print_json({"ok": False, "error": f"Failed to fetch repo visibility: {exc}"})
+        return 2
+
+    visibility = (vis_data.get("visibility") or "UNKNOWN").upper()
+    is_private = vis_data.get("isPrivate", None)
+
+    # Config flags
+    write_tools_enabled = bool(config.get("allow_write_tools", False))
+    block_on_public = bool(config.get("block_writes_on_public_repo", True))
+    allow_override = bool(config.get("allow_public_repo_write_override", False))
+
+    # Determine if writes should be blocked
+    is_public = is_private is False or visibility == "PUBLIC"
+
+    write_tools_blocked = False
+    warnings: list[str] = []
+
+    if is_public:
+        warnings.append(
+            "Repository is public. Write-capable tools are blocked by repo visibility guard."
+        )
+        if block_on_public and not allow_override:
+            write_tools_blocked = True
+        elif allow_override:
+            warnings.append(
+                "Public repo write override is enabled. Write operations are conditionally allowed."
+            )
+    else:
+        warnings.append("Repository is private. No visibility-based write restrictions.")
+
+    # Recommended next action
+    if write_tools_blocked:
+        recommended_action = "Make the repository private or keep write tools disabled."
+    elif is_public and allow_override:
+        recommended_action = "Public repo write override is active. Proceed with caution."
+    elif is_public:
+        recommended_action = "Repository is public but writes are not blocked by guard. Verify config."
+    else:
+        recommended_action = "Repository is private. No visibility-based write restrictions."
+
+    result = {
+        "ok": True,
+        "repository": repo,
+        "visibility": visibility,
+        "is_private": is_private,
+        "write_tools_enabled": write_tools_enabled,
+        "block_writes_on_public_repo": block_on_public,
+        "allow_public_repo_write_override": allow_override,
+        "write_tools_blocked": write_tools_blocked,
+        "warnings": warnings,
+        "recommended_next_action": recommended_action,
+    }
+    print_json(result)
     return 0
 
 
@@ -187,6 +1071,176 @@ def cmd_pr_view(config: dict[str, Any], args: argparse.Namespace) -> int:
         "number,title,state,isDraft,author,headRefName,baseRefName,mergeStateStatus,reviewDecision,url",
     ])
     print_json(payload)
+    return 0
+
+
+def cmd_pr_dashboard(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """PR Intelligence Dashboard: summarize open PRs with risk and action data."""
+    repo = resolve_repo(config, args.repo)
+    raw_prs = run_gh_json([
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "open",
+        "--limit",
+        str(args.limit),
+        "--json",
+        "number,title,state,isDraft,author,headRefName,baseRefName,updatedAt,url,mergeStateStatus,reviewDecision,createdAt",
+    ])
+
+    if not isinstance(raw_prs, list):
+        raw_prs = []
+
+    normalized = []
+    for pr in raw_prs:
+        entry = _normalize_pr(pr)
+        risk_levels, recommended_action = _classify_pr_risk(entry)
+        entry["risk_levels"] = risk_levels
+        entry["recommended_action"] = recommended_action
+        normalized.append(entry)
+
+    summary = _build_dashboard_summary(normalized)
+
+    output = {
+        "ok": True,
+        "repository": repo,
+        "total_count": len(normalized),
+        "summary": summary,
+        "prs": normalized,
+    }
+    print_json(output)
+    return 0
+
+
+def _normalize_pr(pr: dict[str, Any]) -> dict[str, Any]:
+    """Normalize gh PR output into a stable internal schema."""
+    author_info = pr.get("author") or {}
+    return {
+        "number": pr.get("number"),
+        "title": pr.get("title"),
+        "state": pr.get("state"),
+        "is_draft": bool(pr.get("isDraft")),
+        "author": author_info.get("login") if isinstance(author_info, dict) else str(author_info),
+        "head_branch": pr.get("headRefName"),
+        "base_branch": pr.get("baseRefName"),
+        "updated_at": pr.get("updatedAt"),
+        "created_at": pr.get("createdAt"),
+        "url": pr.get("url"),
+        "merge_state": pr.get("mergeStateStatus"),
+        "review_decision": pr.get("reviewDecision"),
+    }
+
+
+def _classify_pr_risk(pr: dict[str, Any]) -> tuple[list[str], str]:
+    """Classify a PR into risk levels and recommend a next action."""
+    risk_levels: list[str] = []
+    actions: list[str] = []
+
+    # Draft PRs are low readiness
+    if pr.get("is_draft"):
+        risk_levels.append("draft")
+        actions.append("Complete draft before requesting review")
+
+    # Review decision analysis
+    review = pr.get("review_decision", "") or ""
+    if review == "":
+        risk_levels.append("needs_review")
+        actions.append("Request or await review")
+    elif review == "CHANGES_REQUESTED":
+        risk_levels.append("changes_requested")
+        actions.append("Address requested changes")
+    elif review == "REVIEW_REQUIRED":
+        risk_levels.append("needs_review")
+        actions.append("Await review completion")
+
+    # Merge state analysis
+    merge = pr.get("merge_state", "") or ""
+    if merge == "UNKNOWN" or merge == "":
+        risk_levels.append("unknown_merge")
+        actions.append("Check CI status and merge conflicts")
+    elif merge == "DIRTY":
+        risk_levels.append("merge_conflict")
+        actions.append("Resolve merge conflicts")
+    elif merge == "BLOCKED":
+        risk_levels.append("blocked")
+        actions.append("Unblock merge requirements")
+
+    # Staleness check (not updated in > 7 days)
+    updated = pr.get("updated_at", "") or ""
+    if updated:
+        try:
+            updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            if (now - updated_dt) > timedelta(days=7):
+                risk_levels.append("stale")
+                actions.append("Follow up or consider closing stale PR")
+        except (ValueError, TypeError):
+            pass
+
+    # If no risks identified, the PR appears ready
+    if not risk_levels:
+        risk_levels.append("ready")
+        actions.append("Ready to merge")
+
+    recommended_action = "; ".join(actions) if actions else "Review manually"
+    return risk_levels, recommended_action
+
+
+def _build_dashboard_summary(prs: list[dict[str, Any]]) -> dict[str, int]:
+    """Build aggregate counts for the dashboard."""
+    summary: dict[str, int] = {
+        "total": len(prs),
+        "draft": 0,
+        "needs_review": 0,
+        "changes_requested": 0,
+        "stale": 0,
+        "merge_conflict": 0,
+        "blocked": 0,
+        "unknown_merge": 0,
+        "ready": 0,
+    }
+    for pr in prs:
+        for level in pr.get("risk_levels", []):
+            if level in summary:
+                summary[level] += 1
+    return summary
+
+
+def cmd_pr_readiness(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Compute a PR readiness score from metadata, checks, and changed files."""
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+    number: int = args.number
+    fetch_errors: list[str] = []
+
+    # Fetch PR metadata (required)
+    try:
+        pr_data = _fetch_pr_metadata(repo, number)
+    except ToolError as exc:
+        print_json({"ok": False, "error": f"Failed to fetch PR metadata: {exc}"})
+        return 2
+
+    # Fetch changed files (best-effort)
+    try:
+        files = _fetch_changed_files(repo, number)
+    except ToolError as exc:
+        files = []
+        fetch_errors.append(f"Changed files unavailable: {exc}")
+
+    # Fetch checks (best-effort)
+    try:
+        checks = _fetch_pr_checks(repo, number)
+    except ToolError as exc:
+        checks = []
+        fetch_errors.append(f"Checks unavailable: {exc}")
+
+    result = _score_pr_readiness(pr_data, files, checks)
+    if fetch_errors:
+        result["fetch_errors"] = fetch_errors
+    result["ok"] = True
+    print_json(result)
     return 0
 
 
@@ -242,6 +1296,2032 @@ def cmd_runs_list(config: dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
+
+
+# ---------------------------------------------------------------------------
+# Feature 4: GitHub Actions Failure Explainer
+# ---------------------------------------------------------------------------
+
+def cmd_runs_failed(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """List failed GitHub Actions workflow runs with failure classification."""
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+
+    try:
+        runs = run_gh_json([
+            "run", "list",
+            "--repo", repo,
+            "--status", "failure",
+            "--limit", str(args.limit),
+            "--json",
+            "databaseId,workflowName,status,conclusion,createdAt,updatedAt,url,headBranch,event",
+        ])
+    except ToolError as exc:
+        print_json({"ok": False, "error": str(exc)})
+        return 2
+
+    if not isinstance(runs, list):
+        runs = []
+
+    failed_runs: list[dict[str, Any]] = []
+    for run in runs:
+        run_id = run.get("databaseId")
+        if not run_id:
+            continue
+
+        # Best-effort classification: fetch a small log excerpt
+        log_excerpt = _fetch_failed_run_log(repo, run_id, max_lines=150)
+        classification = _classify_failure(log_excerpt)
+
+        entry: dict[str, Any] = {
+            "database_id": run_id,
+            "workflow_name": run.get("workflowName", ""),
+            "status": run.get("status", ""),
+            "conclusion": run.get("conclusion", ""),
+            "branch": run.get("headBranch", ""),
+            "event": run.get("event", ""),
+            "url": run.get("url", ""),
+            "created_at": run.get("createdAt", ""),
+            "updated_at": run.get("updatedAt", ""),
+            "probable_failure_class": classification["class"],
+            "recommended_local_command": classification["recommended_command"],
+            "next_debugging_step": classification["next_step"],
+        }
+        failed_runs.append(entry)
+
+    output = {
+        "ok": True,
+        "repository": repo,
+        "failed_runs": failed_runs,
+        "total_count": len(failed_runs),
+    }
+    print_json(output)
+    return 0
+
+
+def cmd_run_explain(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Explain a failed GitHub Actions workflow run with log excerpts."""
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+    run_id: int = args.run_id
+    log_lines: int = getattr(args, "log_lines", 80)
+
+    # Fetch run metadata
+    try:
+        run_data = run_gh_json([
+            "run", "view", str(run_id),
+            "--repo", repo,
+            "--json",
+            "databaseId,workflowName,status,conclusion,createdAt,updatedAt,url,headBranch,event",
+        ])
+    except ToolError as exc:
+        print_json({"ok": False, "error": str(exc)})
+        return 2
+
+    if not isinstance(run_data, dict):
+        run_data = {}
+
+    # Fetch log excerpt
+    log_excerpt = _fetch_failed_run_log(repo, run_id, max_lines=log_lines)
+
+    # Count actual lines returned (before truncation marker)
+    actual_lines = log_excerpt.count("\n") + 1 if log_excerpt else 0
+
+    # Classify
+    classification = _classify_failure(log_excerpt)
+
+    output = {
+        "ok": True,
+        "repository": repo,
+        "run_id": run_id,
+        "workflow_name": run_data.get("workflowName", ""),
+        "status": run_data.get("status", ""),
+        "conclusion": run_data.get("conclusion", ""),
+        "branch": run_data.get("headBranch", ""),
+        "event": run_data.get("event", ""),
+        "url": run_data.get("url", ""),
+        "created_at": run_data.get("createdAt", ""),
+        "updated_at": run_data.get("updatedAt", ""),
+        "probable_failure_class": classification["class"],
+        "recommended_local_command": classification["recommended_command"],
+        "next_debugging_step": classification["next_step"],
+        "log_excerpt": log_excerpt,
+        "log_lines_returned": actual_lines,
+    }
+    print_json(output)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Feature 5: Safe PR Creator
+# ---------------------------------------------------------------------------
+
+
+def cmd_pr_create(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Create a pull request with heavy safety gates.
+
+    All of the following must pass before a PR is created:
+
+    1. allow_write_tools is true in config.
+    2. --confirm is present.
+    3. Current branch is not main or master.
+    4. Working tree is clean.
+    5. Branch has commits ahead of base.
+    6. PR title is non-empty.
+    7. Body file exists.
+    8. Repository is allowlisted.
+    9. Repository visibility guard does not block.
+    """
+    # Gate 1: --confirm flag present
+    if not getattr(args, "confirm", False):
+        print_json({"ok": False, "error": "Refusing to create PR without --confirm."})
+        return 1
+
+    # Gate 2: Write tools enabled
+    if not config.get("allow_write_tools", False):
+        print_json({
+            "ok": False,
+            "error": (
+                "Write tools are disabled. "
+                "Set allow_write_tools=true in config to enable gated write commands."
+            ),
+        })
+        return 1
+
+    # Gate 3: PR title is non-empty
+    title = (getattr(args, "title", "") or "").strip()
+    if not title:
+        print_json({"ok": False, "error": "PR title must be non-empty."})
+        return 1
+
+    # Gate 4: Body file exists
+    body_file = getattr(args, "body_file", "")
+    if not body_file:
+        print_json({"ok": False, "error": "Refusing to create PR without --body-file."})
+        return 1
+
+    body_path = Path(body_file)
+    if not body_path.exists():
+        print_json({
+            "ok": False,
+            "error": f"Refusing to create PR: body file does not exist: {body_file}",
+        })
+        return 1
+
+    # Gate 5: Repository is allowlisted (resolve_repo enforces allowlist)
+    repo = resolve_repo(config, args.repo)
+
+    # Determine base branch
+    base = getattr(args, "base", "main") or "main"
+
+    # Determine head branch: resolve "current" to actual branch name
+    head_raw = getattr(args, "head", "")
+    if not head_raw:
+        print_json({"ok": False, "error": "Refusing to create PR without --head."})
+        return 1
+
+    if head_raw == "current":
+        head = _git_current_branch()
+    else:
+        head = head_raw
+
+    # Get current branch for safety checks
+    current_branch = _git_current_branch()
+
+    # Gate 6: Current branch is not main or master
+    if current_branch in ("main", "master"):
+        print_json({"ok": False, "error": "Refusing to create PR from main branch."})
+        return 1
+
+    # Gate 7: Working tree is clean
+    if not _git_working_tree_clean():
+        print_json({
+            "ok": False,
+            "error": (
+                "Refusing to create PR: working tree is not clean. "
+                "Commit or stash changes first."
+            ),
+        })
+        return 1
+
+    # Gate 8: Branch has commits ahead of base
+    ahead = _branch_ahead_count(base, head)
+    if ahead == 0:
+        print_json({
+            "ok": False,
+            "error": (
+                f"Refusing to create PR: head branch '{head}' "
+                f"has 0 commits ahead of base '{base}'."
+            ),
+        })
+        return 1
+
+    # Gate 9: Repository visibility guard
+    if _repo_visibility_blocks_writes(config, repo):
+        print_json({
+            "ok": False,
+            "error": "Repository visibility guard blocked write operation because repository is public."
+        })
+        return 1
+
+    # ── Safe PR preview (stderr) ──────────────────────────────────
+    preview_lines = [
+        "--- PR Preview ---",
+        f"Repository:     {repo}",
+        f"Title:          {title}",
+        f"Base:           {base}",
+        f"Head:           {head}",
+        f"Body file:      {body_path}",
+        f"Commits ahead:  {ahead}",
+        f"Current branch: {current_branch}",
+        "--- Creating PR ---",
+    ]
+    print("\n".join(preview_lines), file=sys.stderr)
+
+    # ── Execute gh pr create ──────────────────────────────────────
+    result = subprocess.run(
+        [
+            "gh", "pr", "create",
+            "--repo", repo,
+            "--title", title,
+            "--body-file", str(body_path),
+            "--base", base,
+            "--head", head,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        print_json({
+            "ok": False,
+            "error": result.stderr.strip() or "gh pr create failed",
+        })
+        return 2
+
+    url = result.stdout.strip()
+
+    output = {
+        "ok": True,
+        "repository": repo,
+        "title": title,
+        "base": base,
+        "head": head,
+        "url": url,
+        "write_action": "pr_create",
+    }
+    print_json(output)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Feature 6: PR Body Generator
+# ---------------------------------------------------------------------------
+
+def _sanitize_filename(name: str) -> str:
+    """Sanitize branch name for use as a filename.
+
+    Replaces unsafe characters with hyphens, collapses multiple hyphens,
+    and strips leading/trailing hyphens and dots.
+    """
+    safe = re.sub(r'[^a-zA-Z0-9._-]', '-', name)
+    safe = re.sub(r'-{2,}', '-', safe)
+    safe = safe.strip('.-')
+    return safe if safe else "unnamed-branch"
+
+
+def _resolve_base_branch() -> str:
+    """Find the base branch to compare against.
+
+    Tries origin/main first, falls back to main.
+    Returns the branch name used.
+    """
+    for candidate in ("origin/main", "main"):
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", candidate],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return candidate
+    raise ToolError(
+        "Cannot find origin/main or main as base branch. "
+        "Create one or fetch from remote."
+    )
+
+
+def _collect_commit_subjects(base: str) -> list[str]:
+    """Collect commit subject lines from base..HEAD."""
+    result = subprocess.run(
+        ["git", "log", "--oneline", f"{base}..HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    return [line for line in result.stdout.strip().split("\n") if line]
+
+
+def _collect_changed_files(base: str) -> list[str]:
+    """Collect changed file paths with status markers from base..HEAD."""
+    result = subprocess.run(
+        ["git", "diff", "--name-status", f"{base}..HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    return [line for line in result.stdout.strip().split("\n") if line]
+
+
+def _collect_diff_stat(base: str) -> str:
+    """Collect compact diff stat from base..HEAD."""
+    result = subprocess.run(
+        ["git", "diff", "--stat", f"{base}..HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _extract_path_from_status(status_line: str) -> str:
+    """Extract the file path from a git diff --name-status line.
+
+    Lines have the format: M\tpath/to/file or A\tpath/to/file
+    For renames, the format is: R100\told\tnew
+    Returns the last tab-separated component (the destination path).
+    """
+    parts = status_line.split("\t")
+    return parts[-1] if parts else status_line
+
+
+def _detect_verification() -> tuple[bool, str]:
+    """Detect whether smoke test / verifier were recently run.
+
+    Returns (verification_detected, message).
+    Does not invent successful verification — only reports what can be proven.
+    """
+    smoke_files = [
+        "/tmp/github-multitool-cli-health.json",
+        "/tmp/github-multitool-cli-pr-readiness.json",
+    ]
+    found = 0
+    for fp in smoke_files:
+        p = Path(fp)
+        if p.exists():
+            try:
+                mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+                age = datetime.now(timezone.utc) - mtime
+                if age < timedelta(hours=24):
+                    found += 1
+            except OSError:
+                pass
+
+    if found > 0:
+        return (
+            True,
+            f"Smoke test evidence detected ({found} output file(s) modified within 24 hours).",
+        )
+    return (
+        False,
+        "Not automatically verified by this generator. Run the commands below before opening the PR.",
+    )
+
+
+def _generate_summary(
+    commit_subjects: list[str],
+    changed_files: list[str],
+    branch: str,
+) -> str:
+    """Generate a brief summary of the branch purpose."""
+    num_commits = len(commit_subjects)
+    num_files = len(changed_files)
+
+    if num_commits == 0:
+        return (
+            f"Branch `{branch}` has no commits ahead of base. "
+            f"{num_files} file(s) differ from base."
+        )
+
+    # Use first commit subject (without short hash) as a lead
+    first = commit_subjects[0]
+    first_subject = first.split(" ", 1)[1] if " " in first else first
+
+    # Identify affected directories
+    affected_dirs: set[str] = set()
+    for cf in changed_files:
+        path = _extract_path_from_status(cf)
+        top = path.split("/")[0] if "/" in path else "(root)"
+        affected_dirs.add(top)
+
+    dirs_str = ", ".join(sorted(affected_dirs)[:5])
+    if len(affected_dirs) > 5:
+        dirs_str += f", ... (+{len(affected_dirs) - 5} more)"
+
+    lines = [
+        f"Branch `{branch}` contains {num_commits} commit(s) affecting "
+        f"{num_files} file(s) across {dirs_str}.",
+        "",
+    ]
+    if num_commits == 1:
+        lines.append(f"**Change**: {first_subject}")
+    else:
+        lines.append(f"**First commit**: {first_subject}")
+        lines.append(f"_({num_commits - 1} additional commit(s) — see Changes section below)_")
+
+    return "\n".join(lines)
+
+
+def _build_pr_body_md(
+    branch: str,
+    base: str,
+    commit_subjects: list[str],
+    changed_files: list[str],
+    diff_stat: str,
+    verification_detected: bool,
+    verification_message: str,
+) -> str:
+    """Build the PR body Markdown content."""
+    lines: list[str] = []
+
+    # ── Header ──
+    lines.append(f"# PR Body: {branch}")
+    lines.append("")
+
+    # ── Summary ──
+    lines.append("## Summary")
+    lines.append("")
+    lines.append(_generate_summary(commit_subjects, changed_files, branch))
+    lines.append("")
+
+    # ── Changes ──
+    lines.append("## Changes")
+    lines.append("")
+
+    if commit_subjects:
+        lines.append("### Commits")
+        lines.append("")
+        for cs in commit_subjects:
+            lines.append(f"- {cs}")
+        lines.append("")
+
+    if changed_files:
+        lines.append("### Changed Files")
+        lines.append("")
+        for cf in changed_files:
+            lines.append(f"- `{cf}`")
+        lines.append("")
+
+    if diff_stat:
+        lines.append("### Diff Stat")
+        lines.append("")
+        lines.append("```")
+        lines.append(diff_stat)
+        lines.append("```")
+        lines.append("")
+
+    # ── Verification ──
+    lines.append("## Verification")
+    lines.append("")
+    lines.append("Run the following commands before opening the PR:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append("tools/github-multitool/smoke-test.sh")
+    lines.append("./scripts/verify-opencode-os.sh")
+    lines.append("git status --short --branch")
+    lines.append("```")
+    lines.append("")
+    lines.append(verification_message)
+    lines.append("")
+
+    # ── Risk ──
+    lines.append("## Risk")
+    lines.append("")
+
+    # Identify high-risk files from changed files
+    high_risk: list[str] = []
+    for cf in changed_files:
+        path = _extract_path_from_status(cf)
+        if _is_high_risk_file(path):
+            high_risk.append(path)
+
+    if high_risk:
+        lines.append(f"**⚠️ {len(high_risk)} high-risk file(s) detected.**")
+        lines.append("")
+        lines.append("The following files match high-risk patterns:")
+        lines.append("")
+        for f in high_risk:
+            lines.append(f"- `{f}`")
+        lines.append("")
+        lines.append("Pay extra attention to:")
+        lines.append("- Configuration and workflow impacts")
+        lines.append("- Security-sensitive paths")
+        lines.append("- Infrastructure changes")
+    else:
+        lines.append("No high-risk files detected in this change set.")
+        lines.append("")
+        lines.append("Standard review practices apply.")
+
+    lines.append("")
+
+    # ── Rollback ──
+    lines.append("## Rollback")
+    lines.append("")
+    base_clean = base.replace("origin/", "")
+    lines.append("To abandon this branch before merge:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append(f"git checkout {base_clean}")
+    lines.append(f"git branch -D {branch}")
+    lines.append("```")
+    lines.append("")
+    lines.append("If already merged and needs reversion:")
+    lines.append("")
+    lines.append("```bash")
+    lines.append("git revert <merge-commit-hash>")
+    lines.append("```")
+    lines.append("")
+
+    # ── Reviewer Notes ──
+    lines.append("## Reviewer Notes")
+    lines.append("")
+    lines.append(f"- **Branch**: `{branch}` → `{base}`")
+    lines.append(f"- **Commits**: {len(commit_subjects)}")
+    lines.append(f"- **Files changed**: {len(changed_files)}")
+    lines.append("")
+    if high_risk:
+        lines.append("### Files Requiring Extra Scrutiny")
+        lines.append("")
+        for f in high_risk:
+            lines.append(f"- `{f}`")
+        lines.append("")
+    lines.append("Review checklist:")
+    lines.append("")
+    lines.append("1. **Correctness** — Does the logic accomplish the intended goal?")
+    lines.append("2. **Safety** — Are there security risks, token leaks, or unsafe patterns?")
+    lines.append("3. **Regression** — Could this break existing features or smoke tests?")
+    lines.append("4. **Completeness** — Are tests, documentation, and verification adequate?")
+    lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+def cmd_pr_body(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Generate a local PR body Markdown file from commits, changed files,
+    and available verification context.
+
+    Output is written to dist/github-pr-bodies/.
+    """
+    root = repo_root()
+
+    # Determine current branch
+    current_branch = _git_current_branch()
+
+    # Refuse if on main or master
+    if current_branch in ("main", "master"):
+        print_json({
+            "ok": False,
+            "error": (
+                f"Refusing to generate PR body on '{current_branch}' branch. "
+                "Switch to a feature branch first."
+            ),
+        })
+        return 1
+
+    # Determine base branch (origin/main fallback main)
+    base = _resolve_base_branch()
+
+    # Collect data from git
+    commit_subjects = _collect_commit_subjects(base)
+    changed_files = _collect_changed_files(base)
+    diff_stat = _collect_diff_stat(base)
+
+    # Detect verification status
+    verification_detected, verification_message = _detect_verification()
+
+    # Build markdown content
+    md_content = _build_pr_body_md(
+        branch=current_branch,
+        base=base,
+        commit_subjects=commit_subjects,
+        changed_files=changed_files,
+        diff_stat=diff_stat,
+        verification_detected=verification_detected,
+        verification_message=verification_message,
+    )
+
+    # Create output directory
+    output_dir = root / "dist" / "github-pr-bodies"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate safe filename from branch name
+    safe_branch = _sanitize_filename(current_branch)
+    output_path = output_dir / f"pr-body-{safe_branch}.md"
+
+    # Write file
+    output_path.write_text(md_content, encoding="utf-8")
+
+    # Print JSON result
+    result = {
+        "ok": True,
+        "output_path": str(output_path),
+        "branch": current_branch,
+        "base": base,
+        "commit_count": len(commit_subjects),
+        "changed_file_count": len(changed_files),
+        "verification_detected": verification_detected,
+    }
+    print_json(result)
+    return 0
+# ---------------------------------------------------------------------------
+# Feature 7: Branch Cleanup Advisor helpers and command
+# ---------------------------------------------------------------------------
+
+def _git_list_local_branches() -> list[str]:
+    """List local branch names via git branch --format."""
+    result = subprocess.run(
+        ["git", "branch", "--format=%(refname:short)"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ToolError(
+            "Failed to list local branches: "
+            + (result.stderr.strip() or "unknown error")
+        )
+    return [b.strip() for b in result.stdout.strip().split("\n") if b.strip()]
+
+
+def _git_list_remote_branches() -> list[str]:
+    """List remote tracking branches (origin/* only, excluding HEAD)."""
+    result = subprocess.run(
+        ["git", "branch", "-r", "--format=%(refname:short)"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    all_remote = [b.strip() for b in result.stdout.strip().split("\n") if b.strip()]
+    return [
+        b for b in all_remote
+        if b.startswith("origin/") and "->" not in b and not b.endswith("/HEAD")
+    ]
+
+
+def _git_get_merged_branches(target: str, *, remote: bool = False) -> set[str]:
+    """Return branches merged into *target*.
+
+    When *remote* is True, uses ``git branch -r --merged``.
+    Returns an empty set on failure.
+    """
+    if remote:
+        cmd = ["git", "branch", "-r", "--merged", target, "--format=%(refname:short)"]
+    else:
+        cmd = ["git", "branch", "--merged", target, "--format=%(refname:short)"]
+    result = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        return set()
+    branches = {b.strip() for b in result.stdout.strip().split("\n") if b.strip()}
+    if remote:
+        branches = {
+            b for b in branches
+            if b.startswith("origin/") and "->" not in b and not b.endswith("/HEAD")
+        }
+    return branches
+
+
+def _get_default_branch(repo: str) -> str:
+    """Determine the default branch for *repo*.
+
+    Tries ``gh repo view --json defaultBranchRef`` first,
+    then falls back to ``git symbolic-ref refs/remotes/origin/HEAD``,
+    and finally returns ``"main"``.
+    """
+    try:
+        data = run_gh_json(["repo", "view", repo, "--json", "defaultBranchRef"])
+        ref = data.get("defaultBranchRef") or {}
+        if isinstance(ref, dict):
+            name = ref.get("name")
+            if name:
+                return name
+    except ToolError:
+        pass
+
+    # Local fallback
+    result = subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        ref = result.stdout.strip()
+        return ref.split("/")[-1] if "/" in ref else ref
+
+    return "main"
+
+
+def _get_open_pr_branches(repo: str) -> set[str]:
+    """Return the set of headRefName values for open PRs in *repo*."""
+    try:
+        prs = run_gh_json([
+            "pr", "list",
+            "--repo", repo,
+            "--state", "open",
+            "--limit", "200",
+            "--json", "headRefName",
+        ])
+    except ToolError:
+        return set()
+    if not isinstance(prs, list):
+        return set()
+    return {pr.get("headRefName", "") for pr in prs if isinstance(pr, dict)}
+
+
+def cmd_branches_cleanup_plan(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Branch Cleanup Advisor: identify local and remote branches safe to delete.
+
+    This command is strictly read-only.  It never deletes anything.
+    """
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+
+    # ── Gather data ─────────────────────────────────────────────────
+    default_branch = _get_default_branch(repo)
+    current_branch = _git_current_branch()
+
+    try:
+        local_branches = _git_list_local_branches()
+    except ToolError as exc:
+        print_json({"ok": False, "error": str(exc)})
+        return 2
+
+    remote_branches = _git_list_remote_branches()
+
+    # Determine which branches are merged into default (local + remote)
+    merged_local = _git_get_merged_branches(default_branch, remote=False)
+    if not merged_local:
+        # Fallback: try origin/<default> as merge target
+        merged_local = _git_get_merged_branches(f"origin/{default_branch}", remote=False)
+
+    merged_remote = _git_get_merged_branches(f"origin/{default_branch}", remote=True)
+
+    # Open PR branches
+    open_pr_branches = _get_open_pr_branches(repo)
+
+    # ── Classify ────────────────────────────────────────────────────
+    protected = {"main", "master", default_branch}
+
+    do_not_delete: list[dict[str, str]] = []
+    safe_local: list[dict[str, str]] = []
+    safe_remote: list[dict[str, str]] = []
+    manual_review: list[dict[str, str]] = []
+
+    # --- Local branches ---
+    for branch in local_branches:
+        if branch in protected:
+            do_not_delete.append({
+                "branch": branch,
+                "reason": "Default branch.",
+            })
+            continue
+
+        if branch == current_branch:
+            do_not_delete.append({
+                "branch": branch,
+                "reason": "Current checked-out branch.",
+            })
+            continue
+
+        if branch in open_pr_branches:
+            do_not_delete.append({
+                "branch": branch,
+                "reason": "Has an open pull request.",
+            })
+            continue
+
+        if branch in merged_local:
+            safe_local.append({
+                "branch": branch,
+                "reason": f"Merged into {default_branch} and has no open PR.",
+                "suggested_command": f"git branch -d {branch}",
+            })
+        else:
+            manual_review.append({
+                "branch": branch,
+                "reason": f"Not merged into {default_branch} and has no open PR.",
+            })
+
+    # --- Remote branches (origin/*) ---
+    merged_remote_raw: set[str] = {b.replace("origin/", "", 1) for b in merged_remote}
+
+    for remote_branch in remote_branches:
+        raw_name = remote_branch.replace("origin/", "", 1)
+
+        if raw_name in protected:
+            do_not_delete.append({
+                "branch": remote_branch,
+                "reason": "Default branch (remote tracking).",
+            })
+            continue
+
+        if raw_name == current_branch:
+            do_not_delete.append({
+                "branch": remote_branch,
+                "reason": "Remote tracking for current checked-out branch.",
+            })
+            continue
+
+        if raw_name in open_pr_branches:
+            do_not_delete.append({
+                "branch": remote_branch,
+                "reason": "Has an open pull request.",
+            })
+            continue
+
+        if raw_name in merged_remote_raw:
+            safe_remote.append({
+                "branch": remote_branch,
+                "reason": f"Remote branch appears merged into {default_branch} and has no open PR.",
+                "suggested_command": f"git push origin --delete {raw_name}",
+            })
+        elif merged_remote:
+            # We have a merged list, and this branch is not in it
+            manual_review.append({
+                "branch": remote_branch,
+                "reason": f"Remote branch not merged into {default_branch}.",
+            })
+        else:
+            manual_review.append({
+                "branch": remote_branch,
+                "reason": "Remote merge state could not be determined (origin tracking may be stale).",
+            })
+
+    # ── Build output ────────────────────────────────────────────────
+    output: dict[str, Any] = {
+        "ok": True,
+        "repository": repo,
+        "default_branch": default_branch,
+        "current_branch": current_branch,
+        "safe_to_delete_local": safe_local,
+        "safe_to_delete_remote": safe_remote,
+        "needs_manual_review": manual_review,
+        "do_not_delete": do_not_delete,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    print_json(output)
+    return 0
+
+# ---------------------------------------------------------------------------
+# Feature 8: Issue-to-Branch Workflow helpers and command
+# ---------------------------------------------------------------------------
+
+
+def _issue_title_to_branch_slug(number: int, title: str) -> str:
+    """Sanitize an issue title into a safe branch name slug.
+
+    Produces names like: issue-012-short-title, issue-004-fix-readme-links.
+    Strips or replaces unsafe branch-name characters, collapses repeated
+    hyphens, and trims to 70 characters.
+    """
+    padded = f"{number:03d}"
+    safe = title.lower()
+    safe = re.sub(r'[^a-z0-9._-]', '-', safe)
+    safe = re.sub(r'-{2,}', '-', safe)
+    safe = safe.strip('.-')
+    # Truncate to fit within a safe total length
+    prefix = f"issue-{padded}-"
+    max_title_len = 70 - len(prefix)
+    if max_title_len < 8:
+        max_title_len = 8  # floor: at least a few chars
+    if len(safe) > max_title_len:
+        safe = safe[:max_title_len].rstrip('-')
+    if not safe:
+        safe = "fix"
+    return f"issue-{padded}-{safe}"
+
+
+def _estimate_issue_risk(
+    title: str, body: str, labels: list[str],
+) -> tuple[str, list[str]]:
+    """Estimate risk based on issue labels, title, and body.
+
+    Returns (risk_level, list_of_reasons).
+    """
+    text = f"{title} {body}".lower()
+    labels_lower = [lb.lower() for lb in labels] if labels else []
+    reasons: list[str] = []
+
+    high_cues = [
+        "security", "secret", "token", "credential", "auth",
+        "deploy", "ci", "pipeline", "config",
+        "production", "breaking-change", "workflow",
+    ]
+    medium_cues = [
+        "feature", "enhancement", "refactor",
+    ]
+    low_cues = [
+        "documentation", "docs", "readme", "typo",
+        "bug", "fix", "guide", "comment",
+    ]
+
+    risk = "low"
+
+    # Check labels (strongest signal)
+    for label in labels_lower:
+        if risk != "high" and any(c in label for c in high_cues):
+            risk = "high"
+            reasons.append(f"'{label}' label indicates high-risk work")
+        elif risk not in ("high", "medium") and any(c in label for c in medium_cues):
+            risk = "medium"
+            reasons.append(f"'{label}' label indicates feature work")
+        elif risk == "low" and any(c in label for c in low_cues):
+            reasons.append(f"'{label}' label indicates low-risk work")
+
+    # Check title/body for cues (only upgrade, never downgrade)
+    if risk != "high":
+        for cue in high_cues:
+            if cue in text:
+                risk = "high"
+                reasons.append(
+                    f"title/body mentions '{cue}' -- potential high risk"
+                )
+                break
+
+    if risk != "high" and risk != "medium":
+        for cue in medium_cues:
+            if cue in text:
+                risk = "medium"
+                reasons.append(
+                    f"title/body mentions '{cue}' -- feature work"
+                )
+                break
+
+    if not reasons:
+        reasons.append("no specific risk cues detected")
+
+    return risk, reasons
+
+
+def _generate_issue_checklist(
+    number: int, labels: list[str], body: str,
+) -> list[str]:
+    """Generate a suggested checklist based on issue labels and body."""
+    checklist = [
+        "Confirm issue scope",
+        "Create branch from updated main",
+        "Implement the smallest complete change",
+        "Run tools/github-multitool/smoke-test.sh",
+        "Run ./scripts/verify-opencode-os.sh",
+        f"Open PR referencing issue #{number}",
+    ]
+
+    labels_lower = [lb.lower() for lb in labels] if labels else []
+
+    # Insert label-specific items after the first two standard items
+    extra: list[str] = []
+    if any(x in labels_lower
+           for x in ["documentation", "docs", "readme"]):
+        extra.append("Update project-memory.md")
+    if any(x in labels_lower
+           for x in ["security", "token", "secret", "credential", "auth"]):
+        extra.append("Run security audit review")
+    if any(x in labels_lower
+           for x in ["workflow", "ci", "deploy"]):
+        extra.append("Validate workflow YAML syntax")
+    if any(x in labels_lower
+           for x in ["bug", "fix"]):
+        extra.append("Add test to prevent regression")
+
+    # Insert extras after "Create branch from updated main"
+    for item in reversed(extra):
+        checklist.insert(3, item)
+
+    return checklist
+
+
+def _generate_issue_warnings(
+    issue_data: dict[str, Any], branch_name: str,
+) -> list[str]:
+    """Generate warnings for the issue-to-branch plan."""
+    warnings: list[str] = []
+
+    state = (issue_data.get("state") or "").upper()
+    if state == "CLOSED":
+        warnings.append(
+            "Issue is closed - verify it should be reopened"
+        )
+
+    body = (issue_data.get("body") or "").strip()
+    if not body:
+        warnings.append(
+            "Issue body is empty - may lack sufficient context"
+        )
+
+    # Check for very short slug
+    slug = branch_name
+    if "issue-" in slug:
+        parts = slug.split("issue-", 1)[-1].split("-", 1)
+        if len(parts) > 1:
+            slug_suffix = parts[1]
+        else:
+            slug_suffix = ""
+    else:
+        slug_suffix = slug
+
+    if len(slug_suffix) < 5:
+        warnings.append(
+            f"Title produces a very short slug "
+            f"({slug_suffix!r}) - branch name may be ambiguous"
+        )
+
+    # Check for high-risk labels
+    raw_labels = issue_data.get("labels") or []
+    high_cues = [
+        "security", "secret", "token", "credential", "auth",
+        "deploy", "ci", "pipeline", "config",
+        "production", "breaking-change",
+    ]
+    for label in raw_labels:
+        label_name = (
+            label.get("name", str(label))
+            if isinstance(label, dict)
+            else str(label)
+        ).lower()
+        for cue in high_cues:
+            if cue in label_name:
+                warnings.append(
+                    f"High-risk label '{label_name}' detected "
+                    f"- review with extra care"
+                )
+                break
+
+    return warnings
+
+
+def cmd_issue_plan(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Issue-to-Branch Workflow: turn a GitHub issue into a safe local branch plan.
+
+    This command is strictly advisory and read-only.  It does **not**:
+
+    * create a branch
+    * assign, edit, close, label, comment on, or mutate the issue
+    * execute any git commands
+
+    It produces a stable JSON plan that must be reviewed before any
+    manual action is taken.
+    """
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+    number: int = args.number
+
+    # Fetch issue metadata
+    try:
+        issue_data = run_gh_json([
+            "issue", "view", str(number),
+            "--repo", repo,
+            "--json", "number,title,state,author,labels,url,body",
+        ])
+    except ToolError as exc:
+        print_json({"ok": False, "error": f"Failed to fetch issue: {exc}"})
+        return 2
+
+    if not isinstance(issue_data, dict):
+        issue_data = {}
+
+    title = (issue_data.get("title") or "").strip()
+    state = (issue_data.get("state") or "UNKNOWN").upper()
+    url = issue_data.get("url", "") or ""
+    body = issue_data.get("body", "") or ""
+
+    # Normalize author
+    author_data = issue_data.get("author") or {}
+    if isinstance(author_data, dict):
+        author = author_data.get("login", "unknown")
+    else:
+        author = str(author_data) if author_data else "unknown"
+
+    # Normalize labels to plain strings
+    raw_labels = issue_data.get("labels") or []
+    if isinstance(raw_labels, list):
+        labels = [
+            lb.get("name", str(lb)) if isinstance(lb, dict) else str(lb)
+            for lb in raw_labels
+        ]
+    else:
+        labels = []
+
+    # Generate branch name slug
+    branch_name = _issue_title_to_branch_slug(number, title)
+
+    # Estimate risk
+    risk, risk_reasons = _estimate_issue_risk(title, body, labels)
+
+    # Generate checklist
+    checklist = _generate_issue_checklist(number, labels, body)
+
+    # Build first commands (never executed)
+    first_commands = [
+        "git checkout main",
+        "git pull --ff-only origin main",
+        f"git checkout -b {branch_name}",
+    ]
+
+    # Suggested PR title
+    if title:
+        suggested_pr_title = f"Resolve #{number}: {title}"
+    else:
+        suggested_pr_title = f"Resolve #{number}"
+
+    # Build normalized issue info
+    issue_info: dict[str, Any] = {
+        "number": number,
+        "title": title,
+        "state": state,
+        "url": url,
+        "author": author,
+        "labels": labels,
+    }
+
+    # Generate warnings
+    warnings = _generate_issue_warnings(issue_data, branch_name)
+
+    output: dict[str, Any] = {
+        "ok": True,
+        "repository": repo,
+        "issue": issue_info,
+        "recommended_branch_name": branch_name,
+        "risk": risk,
+        "risk_reasons": risk_reasons,
+        "first_commands": first_commands,
+        "suggested_pr_title": suggested_pr_title,
+        "suggested_checklist": checklist,
+        "warnings": warnings,
+    }
+    print_json(output)
+    return 0
+
+# ---------------------------------------------------------------------------
+# Feature 10: Security Alerts Summary helpers and command
+# ---------------------------------------------------------------------------
+
+SECURITY_WORKFLOW_KEYWORDS = [
+    "security", "codeql", "dependabot", "secret", "scan", "audit", "vulnerability",
+]
+
+SECURITY_PR_KEYWORDS = [
+    "security", "codeql", "dependabot", "secret", "scan", "audit", "vulnerability",
+]
+
+
+def _try_gh_api(repo: str, endpoint_path: str) -> dict[str, Any]:
+    """Call ``gh api`` safely and return structured result.
+
+    Returns a dict with:
+      - status: "available" or "unavailable"
+      - data: parsed JSON payload (only when status=="available")
+      - reason: explanation (only when status=="unavailable")
+    """
+    require_gh()
+    result = subprocess.run(
+        ["gh", "api", endpoint_path],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "403" in stderr:
+            reason = "GitHub API returned 403 or feature unavailable."
+        elif "404" in stderr:
+            reason = "GitHub API returned 404 or feature not available on this plan."
+        elif "401" in stderr:
+            reason = "GitHub API returned 401 (authentication required)."
+        else:
+            excerpt = stderr[:300].replace("\n", " ")
+            reason = f"GitHub API error: {excerpt}"
+        return {"status": "unavailable", "reason": reason}
+
+    stdout = result.stdout.strip()
+    if not stdout:
+        return {"status": "available", "data": []}
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        return {"status": "unavailable", "reason": f"Non-JSON response from GitHub API: {exc}"}
+
+    return {"status": "available", "data": data}
+
+
+def _check_branch_protection(repo: str, branch: str) -> dict[str, Any]:
+    """Check branch protection status for *branch* via gh api.
+
+    Returns the branch_protection dict for the security summary.
+    404 is treated as: protected=false, availability=not_protected_or_unavailable.
+    """
+    result = _try_gh_api(repo, f"repos/{repo}/branches/{branch}/protection")
+
+    if result.get("status") == "available":
+        data = result.get("data", {})
+        if isinstance(data, dict):
+            # Determine if protected (any rules present)
+            protected = bool(data)
+            requires_reviews = False
+            requires_status_checks = False
+            enforces_admins = False
+
+            if protected:
+                rp = data.get("required_pull_request_reviews") or {}
+                requires_reviews = bool(rp) if isinstance(rp, dict) else bool(rp)
+
+                sc = data.get("required_status_checks") or {}
+                requires_status_checks = bool(sc) if isinstance(sc, dict) else bool(sc)
+
+                ea = data.get("enforce_admins") or {}
+                if isinstance(ea, dict):
+                    enforces_admins = ea.get("enabled", False)
+                elif isinstance(ea, bool):
+                    enforces_admins = ea
+
+            return {
+                "status": "available",
+                "protected": protected,
+                "requires_pull_request_reviews": requires_reviews,
+                "requires_status_checks": requires_status_checks,
+                "enforces_admins": enforces_admins,
+            }
+        else:
+            return {
+                "status": "available",
+                "protected": False,
+                "requires_pull_request_reviews": False,
+                "requires_status_checks": False,
+                "enforces_admins": False,
+            }
+
+    # Unavailable: distinguish 404 from other errors
+    reason = result.get("reason", "")
+    if "404" in reason:
+        return {
+            "status": "not_protected_or_unavailable",
+            "protected": False,
+            "requires_pull_request_reviews": False,
+            "requires_status_checks": False,
+            "enforces_admins": False,
+        }
+    return {
+        "status": "unavailable",
+        "protected": False,
+        "requires_pull_request_reviews": False,
+        "requires_status_checks": False,
+        "enforces_admins": False,
+    }
+
+
+def _check_alert_endpoint(repo: str, alert_type: str) -> dict[str, Any]:
+    """Check a GitHub security alert endpoint and return count/status.
+
+    *alert_type* is one of: dependabot, code-scanning, secret-scanning.
+    """
+    endpoint_map = {
+        "dependabot": f"repos/{repo}/dependabot/alerts?state=open&per_page=1",
+        "code-scanning": f"repos/{repo}/code-scanning/alerts?state=open&per_page=1",
+        "secret-scanning": f"repos/{repo}/secret-scanning/alerts?state=open&per_page=1",
+    }
+    endpoint = endpoint_map.get(alert_type)
+    if not endpoint:
+        return {"status": "unavailable", "open_count": None, "reason": f"Unknown alert type: {alert_type}"}
+
+    result = _try_gh_api(repo, endpoint)
+
+    if result.get("status") == "available":
+        data = result.get("data", [])
+        if isinstance(data, list):
+            return {"status": "available", "open_count": len(data)}
+        elif isinstance(data, dict) and "message" in data:
+            return {"status": "unavailable", "open_count": None, "reason": data.get("message", "Unknown API message")}
+        else:
+            return {"status": "available", "open_count": 0}
+    else:
+        return {
+            "status": "unavailable",
+            "open_count": None,
+            "reason": result.get("reason", "GitHub API unavailable."),
+        }
+
+
+def _detect_security_workflows(root: Path) -> dict[str, Any]:
+    """Detect security-related workflows from local .github/workflows/ files.
+
+    Treats filenames or workflow content containing security-related keywords
+    as security workflows.
+    """
+    workflows_dir = root / ".github" / "workflows"
+    if not workflows_dir.is_dir():
+        return {"present": False, "files": []}
+
+    security_files: list[str] = []
+    for wf_file in sorted(workflows_dir.glob("*.yml")):
+        name_lower = wf_file.name.lower()
+        try:
+            content = wf_file.read_text(encoding="utf-8").lower()
+        except Exception:
+            content = ""
+
+        combined = f"{name_lower} {content}"
+        if any(kw in combined for kw in SECURITY_WORKFLOW_KEYWORDS):
+            security_files.append(str(wf_file.relative_to(root)))
+
+    # Also check .yaml extension
+    for wf_file in sorted(workflows_dir.glob("*.yaml")):
+        name_lower = wf_file.name.lower()
+        try:
+            content = wf_file.read_text(encoding="utf-8").lower()
+        except Exception:
+            content = ""
+
+        combined = f"{name_lower} {content}"
+        if any(kw in combined for kw in SECURITY_WORKFLOW_KEYWORDS):
+            rel = str(wf_file.relative_to(root))
+            if rel not in security_files:
+                security_files.append(rel)
+
+    return {
+        "present": len(security_files) > 0,
+        "files": sorted(security_files),
+    }
+
+
+def _detect_security_prs(repo: str) -> list[dict[str, Any]]:
+    """Detect recent security-related open PRs via ``gh pr list``.
+
+    Filters PR titles, labels, and branch names for security-related terms.
+    """
+    try:
+        prs = run_gh_json([
+            "pr", "list",
+            "--repo", repo,
+            "--state", "open",
+            "--limit", "50",
+            "--json", "number,title,headRefName,url,updatedAt,labels",
+        ])
+    except ToolError:
+        return []
+
+    if not isinstance(prs, list):
+        return []
+
+    security_prs: list[dict[str, Any]] = []
+    for pr in prs:
+        title = (pr.get("title") or "").lower()
+        head_ref = (pr.get("headRefName") or "").lower()
+
+        labels_list = pr.get("labels") or []
+        label_names: list[str] = []
+        for lbl in labels_list:
+            if isinstance(lbl, dict):
+                name = (lbl.get("name") or "").lower()
+            else:
+                name = str(lbl).lower()
+            label_names.append(name)
+
+        combined = f"{title} {head_ref} {' '.join(label_names)}"
+        if any(kw in combined for kw in SECURITY_PR_KEYWORDS):
+            security_prs.append({
+                "number": pr.get("number"),
+                "title": pr.get("title"),
+                "url": pr.get("url"),
+                "updated_at": pr.get("updatedAt"),
+            })
+
+    # Sort by most recently updated first
+    security_prs.sort(key=lambda p: p.get("updated_at") or "", reverse=True)
+    return security_prs
+
+
+def _compute_risk_summary(
+    is_private: bool,
+    branch_protection: dict[str, Any],
+    dependabot: dict[str, Any],
+    code_scanning: dict[str, Any],
+    secret_scanning: dict[str, Any],
+    security_workflows: dict[str, Any],
+) -> dict[str, Any]:
+    """Compute overall security risk level and produce warnings/recommendations."""
+    warnings: list[str] = []
+    is_public = not is_private
+
+    # ── Collect observations ───────────────────────────────────────
+    if is_public:
+        warnings.append("Repository is public.")
+
+    bp_protected = bool(branch_protection.get("protected", False))
+    bp_status = branch_protection.get("status", "unavailable")
+
+    if not bp_protected:
+        if bp_status == "available":
+            warnings.append("Default branch protection is not enabled.")
+        else:
+            warnings.append("Default branch protection is not enabled or unavailable.")
+
+    secret_open = secret_scanning.get("open_count") or 0
+    code_open = code_scanning.get("open_count") or 0
+    dep_open = dependabot.get("open_count") or 0
+
+    if secret_scanning.get("status") == "available" and secret_open > 0:
+        warnings.append(f"{secret_open} open secret scanning alert(s) detected.")
+    if code_scanning.get("status") == "available" and code_open > 0:
+        warnings.append(f"{code_open} open code scanning alert(s) detected.")
+    if dependabot.get("status") == "available" and dep_open > 0:
+        warnings.append(f"{dep_open} open Dependabot alert(s) detected.")
+
+    if dependabot.get("status") == "unavailable":
+        warnings.append("Dependabot alerts are unavailable.")
+    if code_scanning.get("status") == "unavailable":
+        warnings.append("Code scanning alerts are unavailable.")
+    if secret_scanning.get("status") == "unavailable":
+        warnings.append("Secret scanning alerts are unavailable.")
+
+    if not security_workflows.get("present", False):
+        warnings.append("No security workflows detected.")
+
+    # ── Determine risk level ──────────────────────────────────────
+    alerts_available = any(
+        a.get("status") == "available"
+        for a in [dependabot, code_scanning, secret_scanning]
+    )
+    has_open_alerts = (
+        (dependabot.get("status") == "available" and dep_open > 0) or
+        (code_scanning.get("status") == "available" and code_open > 0) or
+        (secret_scanning.get("status") == "available" and secret_open > 0)
+    )
+
+    # HIGH
+    if is_public and secret_scanning.get("status") == "available" and secret_open > 0:
+        level = "high"
+    elif code_scanning.get("status") == "available" and code_open > 0:
+        level = "high"
+    # MEDIUM
+    elif is_public:
+        level = "medium"
+    elif bp_status != "available":
+        level = "medium"
+    elif not bp_protected:
+        level = "medium"
+    elif not alerts_available:
+        level = "medium"
+    elif not security_workflows.get("present", False):
+        level = "medium"
+    # LOW
+    elif not is_public and bp_protected and not has_open_alerts and security_workflows.get("present", False):
+        level = "low"
+    # UNKNOWN
+    elif not alerts_available and bp_status != "available":
+        level = "unknown"
+    else:
+        level = "medium"
+
+    # ── Recommendation ────────────────────────────────────────────
+    if level == "high":
+        recommended = "Address open security alerts and enable branch protection immediately."
+    elif level == "medium":
+        recommended = "Enable branch protection and review GitHub security alert availability."
+    elif level == "low":
+        recommended = "No urgent security actions required. Maintain current posture."
+    else:
+        recommended = "Most security posture checks unavailable. Verify GitHub permissions and plan features."
+
+    return {
+        "level": level,
+        "warnings": warnings,
+        "recommended_next_action": recommended,
+    }
+
+
+def collect_security_summary(config: dict[str, Any], repo: str) -> dict[str, Any]:
+    """Collect a comprehensive security posture summary for *repo*.
+
+    All checks are read-only.  Alert endpoints that return 403/404 are
+    reported as *unavailable* rather than crashing.
+    """
+    require_gh()
+    root = repo_root()
+
+    # ── Visibility ─────────────────────────────────────────────────
+    try:
+        vis_data = run_gh_json([
+            "repo", "view", repo,
+            "--json", "nameWithOwner,visibility,isPrivate",
+        ])
+    except ToolError as exc:
+        return {
+            "ok": False,
+            "error": f"Failed to fetch repository visibility: {exc}",
+        }
+
+    repository_name = vis_data.get("nameWithOwner", repo)
+    visibility = (vis_data.get("visibility") or "UNKNOWN").upper()
+    is_private = vis_data.get("isPrivate", None)
+
+    # ── Default branch ─────────────────────────────────────────────
+    # Reuse _get_default_branch helper (Feature 7)
+    try:
+        default_branch = _get_default_branch(repo)
+    except Exception:
+        default_branch = "main"
+
+    # ── Branch protection ──────────────────────────────────────────
+    branch_protection = _check_branch_protection(repo, default_branch)
+
+    # ── Dependabot alerts ──────────────────────────────────────────
+    dependabot = _check_alert_endpoint(repo, "dependabot")
+
+    # ── Code scanning alerts ───────────────────────────────────────
+    code_scanning = _check_alert_endpoint(repo, "code-scanning")
+
+    # ── Secret scanning alerts ─────────────────────────────────────
+    secret_scanning = _check_alert_endpoint(repo, "secret-scanning")
+
+    # ── Security workflows ─────────────────────────────────────────
+    security_workflows = _detect_security_workflows(root)
+
+    # ── Recent security PRs ────────────────────────────────────────
+    recent_security_prs = _detect_security_prs(repo)
+
+    # ── Risk summary ───────────────────────────────────────────────
+    risk_summary = _compute_risk_summary(
+        is_private=is_private is True,
+        branch_protection=branch_protection,
+        dependabot=dependabot,
+        code_scanning=code_scanning,
+        secret_scanning=secret_scanning,
+        security_workflows=security_workflows,
+    )
+
+    return {
+        "ok": True,
+        "repository": repository_name,
+        "visibility": visibility,
+        "default_branch": default_branch,
+        "branch_protection": branch_protection,
+        "alerts": {
+            "dependabot": dependabot,
+            "code_scanning": code_scanning,
+            "secret_scanning": secret_scanning,
+        },
+        "security_workflows": security_workflows,
+        "recent_security_prs": recent_security_prs,
+        "risk_summary": risk_summary,
+    }
+
+
+def cmd_security_summary(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Summarize GitHub security posture from read-only commands."""
+    require_gh()
+    repo = resolve_repo(config, args.repo)
+    result = collect_security_summary(config, repo)
+    print_json(result)
+    return 0 if result.get("ok") else 2
+
+
+# ---------------------------------------------------------------------------
+# Feature 11: Branch Protection Inspector helpers and command
+# ---------------------------------------------------------------------------
+
+
+def inspect_branch_protection(repo: str, branch: str) -> dict[str, Any]:
+    """Inspect branch protection rules for *branch* via gh api.
+
+    Returns a stable JSON dict with all protection fields normalized.
+    404 (no protection configured) and 403 (permission denied) are
+    handled gracefully without crashing.
+    """
+    require_gh()
+
+    base: dict[str, Any] = {
+        "ok": True,
+        "repository": repo,
+        "branch": branch,
+        "protected": False,
+        "requires_pull_request": False,
+        "required_approving_reviews": 0,
+        "dismisses_stale_reviews": False,
+        "requires_status_checks": False,
+        "required_status_check_contexts": [],
+        "strict_status_checks": False,
+        "requires_linear_history": False,
+        "allows_force_pushes": None,
+        "allows_deletions": None,
+        "admin_enforcement": False,
+        "restrictions": {
+            "users": [],
+            "teams": [],
+            "apps": [],
+        },
+        "raw_availability": "not_protected_or_unavailable",
+        "recommended_next_action": (
+            f"Enable branch protection for {branch} if this repository "
+            "should require reviewed changes."
+        ),
+    }
+
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/branches/{branch}/protection"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "404" in stderr:
+            return base
+        if "403" in stderr:
+            base["protected"] = None
+            base["raw_availability"] = "permission_denied_or_unavailable"
+            base["recommended_next_action"] = (
+                "Verify GitHub permissions to view branch protection rules."
+            )
+            return base
+        base["raw_availability"] = f"api_error: {stderr[:200]}"
+        base["recommended_next_action"] = (
+            "Verify GitHub CLI authentication and repository access."
+        )
+        return base
+
+    stdout = result.stdout.strip()
+    if not stdout:
+        return base  # empty response → no protection
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        base["raw_availability"] = "unexpected_non_json_response"
+        return base
+
+    if not isinstance(data, dict) or not data:
+        return base
+
+    base["protected"] = True
+    base["raw_availability"] = "available"
+    base["recommended_next_action"] = (
+        "Branch protection is active. Review the rules below for consistency."
+    )
+
+    rp = data.get("required_pull_request_reviews")
+    if isinstance(rp, dict):
+        base["requires_pull_request"] = bool(rp)
+        base["required_approving_reviews"] = rp.get(
+            "required_approving_review_count", 0
+        )
+        base["dismisses_stale_reviews"] = bool(
+            rp.get("dismiss_stale_reviews", False)
+        )
+
+    sc = data.get("required_status_checks")
+    if isinstance(sc, dict):
+        base["requires_status_checks"] = bool(sc)
+        base["required_status_check_contexts"] = sc.get("contexts", []) or []
+        base["strict_status_checks"] = bool(sc.get("strict", False))
+
+    rlh = data.get("required_linear_history")
+    if isinstance(rlh, dict):
+        base["requires_linear_history"] = bool(rlh.get("enabled", False))
+
+    afp = data.get("allow_force_pushes")
+    if isinstance(afp, dict):
+        base["allows_force_pushes"] = bool(afp.get("enabled", False))
+
+    ad = data.get("allow_deletions")
+    if isinstance(ad, dict):
+        base["allows_deletions"] = bool(ad.get("enabled", False))
+
+    ea = data.get("enforce_admins")
+    if isinstance(ea, dict):
+        base["admin_enforcement"] = bool(ea.get("enabled", False))
+    elif isinstance(ea, bool):
+        base["admin_enforcement"] = ea
+
+    rest = data.get("restrictions")
+    if isinstance(rest, dict):
+        base["restrictions"] = {
+            "users": list(rest.get("users", []) or []),
+            "teams": list(rest.get("teams", []) or []),
+            "apps": list(rest.get("apps", []) or []),
+        }
+
+    return base
+
+
+def cmd_branch_protection(config: dict[str, Any], args: argparse.Namespace) -> int:
+    """Inspect branch protection rules for a named branch."""
+    repo = resolve_repo(config, args.repo)
+    branch = args.branch
+    result = inspect_branch_protection(repo, branch)
+    print_json(result)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Feature 12: Terminal UI Dashboard helpers and command
+# ---------------------------------------------------------------------------
+
+
+def _aggregate_dashboard_data(config, repo):
+    """Aggregate dashboard data from multiple read-only gh calls.
+
+    Returns a dict with all dashboard fields.  Never crashes when a backend
+    call fails --- reports ``unavailable`` instead.
+    """
+    require_gh()
+    warnings_list = []
+
+    # --- Repository visibility ---
+    try:
+        vis_data = run_gh_json([
+            "repo", "view", repo,
+            "--json", "nameWithOwner,visibility,isPrivate,defaultBranchRef",
+        ])
+    except ToolError as exc:
+        return {"ok": False, "error": f"Failed to fetch repository: {exc}"}
+
+    repository = vis_data.get("nameWithOwner", repo)
+    visibility = (vis_data.get("visibility") or "UNKNOWN").upper()
+    is_private = vis_data.get("isPrivate", None)
+    is_public = is_private is False or visibility == "PUBLIC"
+
+    # --- Default branch ---
+    default_branch_ref = vis_data.get("defaultBranchRef") or {}
+    if isinstance(default_branch_ref, dict):
+        default_branch = default_branch_ref.get("name", "")
+    else:
+        default_branch = ""
+    if not default_branch:
+        try:
+            default_branch = _get_default_branch(repo)
+        except Exception:
+            default_branch = "main"
+
+    # --- Open PR count ---
+    try:
+        prs = run_gh_json([
+            "pr", "list", "--repo", repo,
+            "--state", "open", "--limit", "200",
+            "--json", "number",
+        ])
+        open_prs = len(prs) if isinstance(prs, list) else 0
+    except ToolError:
+        open_prs = -1
+        warnings_list.append("Open PR count unavailable.")
+
+    # --- Open issue count ---
+    try:
+        issues = run_gh_json([
+            "issue", "list", "--repo", repo,
+            "--state", "open", "--limit", "200",
+            "--json", "number",
+        ])
+        open_issues = len(issues) if isinstance(issues, list) else 0
+    except ToolError:
+        open_issues = -1
+        warnings_list.append("Open issue count unavailable.")
+
+    # --- Failed run count ---
+    try:
+        failed = run_gh_json([
+            "run", "list", "--repo", repo,
+            "--status", "failure", "--limit", "20",
+            "--json", "databaseId",
+        ])
+        failed_runs = len(failed) if isinstance(failed, list) else 0
+    except ToolError:
+        failed_runs = -1
+        warnings_list.append("Failed run count unavailable.")
+
+    # --- Branch protection ---
+    bp_status = "unavailable"
+    bp_protected = False
+    try:
+        branch_protection = _check_branch_protection(repo, default_branch)
+        bp_status = branch_protection.get("status", "unavailable")
+        bp_protected = bool(branch_protection.get("protected", False))
+    except Exception:
+        warnings_list.append("Branch protection check failed.")
+
+    # --- Security alerts ---
+    sec_statuses = {}
+    total_alerts = None
+    alerts_available = False
+    try:
+        dependabot = _check_alert_endpoint(repo, "dependabot")
+        code_scanning = _check_alert_endpoint(repo, "code-scanning")
+        secret_scanning = _check_alert_endpoint(repo, "secret-scanning")
+        sec_statuses["dependabot"] = dependabot.get("status", "unavailable")
+        sec_statuses["code_scanning"] = code_scanning.get("status", "unavailable")
+        sec_statuses["secret_scanning"] = secret_scanning.get("status", "unavailable")
+
+        alerts_available = any(
+            a.get("status") == "available"
+            for a in [dependabot, code_scanning, secret_scanning]
+        )
+        if alerts_available:
+            total_alerts = 0
+            for alert_src in [dependabot, code_scanning, secret_scanning]:
+                if alert_src.get("status") == "available" and alert_src.get("open_count") is not None:
+                    total_alerts += int(alert_src["open_count"])
+    except Exception:
+        sec_statuses = {
+            "dependabot": "unavailable",
+            "code_scanning": "unavailable",
+            "secret_scanning": "unavailable",
+        }
+        warnings_list.append("Security alert check failed.")
+
+    # --- Repo guard summary ---
+    block_on_public = bool(config.get("block_writes_on_public_repo", True))
+    allow_override = bool(config.get("allow_public_repo_write_override", False))
+
+    if is_public and block_on_public and not allow_override:
+        repo_guard_summary = "writes blocked (public)"
+        write_tools_blocked = True
+    elif is_public and allow_override:
+        repo_guard_summary = "writes allowed (override)"
+        write_tools_blocked = False
+    elif is_public:
+        repo_guard_summary = "writes allowed (no block)"
+        write_tools_blocked = False
+    else:
+        repo_guard_summary = "private"
+        write_tools_blocked = False
+
+    # --- Recommended next action (priority-ordered) ---
+    if is_public:
+        if not allow_override:
+            warnings_list.append(
+                "Repository is public. Write tools are blocked by visibility guard."
+            )
+        recommended = (
+            "Fix repository visibility if this repo should be private."
+        )
+    elif failed_runs > 0:
+        recommended = (
+            "Investigate {} failed workflow run(s).".format(failed_runs)
+        )
+    elif bp_status != "available" or not bp_protected:
+        recommended = (
+            "Enable branch protection for the default branch."
+        )
+    elif not alerts_available:
+        recommended = (
+            "Review GitHub security alert availability."
+        )
+    elif total_alerts is not None and total_alerts > 0:
+        recommended = (
+            "{} open security alert(s) detected.".format(total_alerts)
+        )
+    elif open_prs > 0:
+        recommended = "Review open pull requests."
+    else:
+        recommended = "No active work. Run next-action later."
+
+    return {
+        "ok": True,
+        "repository": repository,
+        "visibility": visibility,
+        "default_branch": default_branch,
+        "open_prs": open_prs,
+        "open_issues": open_issues,
+        "failed_runs": failed_runs,
+        "branch_protection_status": bp_status,
+        "branch_protection_protected": bp_protected,
+        "security_statuses": sec_statuses,
+        "security_alerts_available": alerts_available,
+        "security_total_alerts": total_alerts,
+        "repo_guard_summary": repo_guard_summary,
+        "is_public": is_public,
+        "write_tools_blocked": write_tools_blocked,
+        "recommended_next_action": recommended,
+        "warnings": warnings_list,
+    }
+
+
+def cmd_dashboard(config, args):
+    """Terminal UI Dashboard --- compact overview optimised for Termius/iPhone.
+
+    Default output is narrow human-readable text.
+    ``--json`` produces stable JSON for agent consumption.
+    """
+    repo = resolve_repo(config, args.repo)
+    use_json = getattr(args, "json_output", False)
+
+    aggregated = _aggregate_dashboard_data(config, repo)
+    if not aggregated.get("ok"):
+        if use_json:
+            print_json(aggregated)
+        else:
+            print("Error: {}".format(aggregated.get("error", "unknown error")))
+        return 2
+
+    repository = aggregated["repository"]
+    visibility = aggregated["visibility"]
+    default_branch = aggregated["default_branch"]
+    open_prs = aggregated["open_prs"]
+    open_issues = aggregated["open_issues"]
+    failed_runs = aggregated["failed_runs"]
+    bp_status = aggregated["branch_protection_status"]
+    bp_protected = aggregated["branch_protection_protected"]
+    sec_statuses = aggregated["security_statuses"]
+    alerts_available = aggregated["security_alerts_available"]
+    total_alerts = aggregated["security_total_alerts"]
+    repo_guard_summary = aggregated["repo_guard_summary"]
+    is_public = aggregated["is_public"]
+    write_tools_blocked = aggregated["write_tools_blocked"]
+    recommended = aggregated["recommended_next_action"]
+    warnings_list = aggregated["warnings"]
+
+    if use_json:
+        result = {
+            "ok": True,
+            "repository": repository,
+            "visibility": visibility,
+            "default_branch": default_branch,
+            "open_prs": open_prs if open_prs >= 0 else None,
+            "open_issues": open_issues if open_issues >= 0 else None,
+            "failed_runs": failed_runs if failed_runs >= 0 else None,
+            "branch_protection": {
+                "status": bp_status,
+                "protected": bp_protected,
+            },
+            "security_summary": {
+                "dependabot": sec_statuses.get("dependabot", "unavailable"),
+                "code_scanning": sec_statuses.get("code_scanning", "unavailable"),
+                "secret_scanning": sec_statuses.get("secret_scanning", "unavailable"),
+                "alerts_available": alerts_available,
+                "total_open_alerts": total_alerts if alerts_available else None,
+            },
+            "repo_guard": {
+                "is_public": is_public,
+                "write_tools_blocked": write_tools_blocked,
+                "summary": repo_guard_summary,
+            },
+            "recommended_next_action": recommended,
+            "warnings": warnings_list,
+        }
+        print_json(result)
+        return 0
+
+    # --- Human-readable compact output ---
+    pr_str = str(open_prs) if open_prs >= 0 else "unavailable"
+    issue_str = str(open_issues) if open_issues >= 0 else "unavailable"
+    failed_str = str(failed_runs) if failed_runs >= 0 else "unavailable"
+
+    if bp_status == "available":
+        bp_str = "enabled" if bp_protected else "not enabled"
+    else:
+        bp_str = "unavailable"
+
+    if alerts_available:
+        t = total_alerts if total_alerts is not None else 0
+        sec_str = "{} open".format(t) if t > 0 else "none detected"
+    else:
+        sec_str = "unavailable"
+
+    lines = [
+        "GitHub Multitool Dashboard",
+        "Repo: {}".format(repository),
+        "Visibility: {}".format(visibility),
+        "Default branch: {}".format(default_branch),
+        "Open PRs: {}".format(pr_str),
+        "Open Issues: {}".format(issue_str),
+        "Failed Runs: {}".format(failed_str),
+        "Branch Protection: {}".format(bp_str),
+        "Security Alerts: {}".format(sec_str),
+        "Repo Guard: {}".format(repo_guard_summary),
+    ]
+
+    if warnings_list:
+        lines.append("")
+        for w in warnings_list:
+            lines.append("WARNING: {}".format(w))
+
+    lines.append("")
+    lines.append("Recommended next action:")
+    lines.append("  {}".format(recommended))
+
+    print("\n".join(lines))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="github_multitool.py",
@@ -262,6 +3342,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=cmd_repo_status)
 
+    p = sub.add_parser("repo-guard", help="Check repository visibility and enforce write protection on public repos.")
+    p.set_defaults(func=cmd_repo_guard)
+
     p = sub.add_parser("prs-list", help="List pull requests.")
     p.add_argument("--state", choices=["open", "closed", "all"], default="open")
     p.add_argument("--limit", type=int, default=20)
@@ -270,6 +3353,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("pr-view", help="View pull request metadata.")
     p.add_argument("number", type=int)
     p.set_defaults(func=cmd_pr_view)
+
+    p = sub.add_parser("pr-dashboard", help="PR intelligence dashboard with risk analysis.")
+    p.add_argument("--limit", type=int, default=50, help="Max PRs to analyze (default: 50).")
+    p.set_defaults(func=cmd_pr_dashboard)
+
+    p = sub.add_parser("pr-readiness", help="Compute a PR readiness score.")
+    p.add_argument("number", type=int)
+    p.set_defaults(func=cmd_pr_readiness)
+
+    p = sub.add_parser("pr-review-pack", help="Generate a local Markdown review pack for a PR.")
+    p.add_argument("number", type=int)
+    p.set_defaults(func=cmd_pr_review_pack)
 
     p = sub.add_parser("issues-list", help="List issues.")
     p.add_argument("--state", choices=["open", "closed", "all"], default="open")
@@ -283,6 +3378,55 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("runs-list", help="List GitHub Actions workflow runs.")
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_runs_list)
+
+    p = sub.add_parser("runs-failed", help="List failed GitHub Actions workflow runs with failure classification.")
+    p.add_argument("--limit", type=int, default=10, help="Max failed runs to return (default: 10).")
+    p.set_defaults(func=cmd_runs_failed)
+
+    p = sub.add_parser("run-explain", help="Explain a failed GitHub Actions workflow run.")
+    p.add_argument("run_id", type=int, help="The run database ID to explain.")
+    p.add_argument("--log-lines", type=int, default=80, help="Max log lines to return (default: 80).")
+    p.set_defaults(func=cmd_run_explain)
+
+
+    p = sub.add_parser("pr-create", help="Create a pull request (gated write tool).")
+    p.add_argument("--title", required=True, help="PR title.")
+    p.add_argument("--body-file", required=True, help="Path to PR body Markdown file.")
+    p.add_argument("--base", default="main", help="Base branch for the PR (default: main).")
+    p.add_argument(
+        "--head",
+        default="current",
+        help='Head branch for the PR. Use "current" to resolve the current branch (default: current).',
+    )
+    p.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Required confirmation flag. The command refuses without this flag.",
+    )
+    p.set_defaults(func=cmd_pr_create)
+
+    p = sub.add_parser("pr-body", help="Generate a local PR body Markdown file from commits and changed files.")
+
+    p.set_defaults(func=cmd_pr_body)
+    p = sub.add_parser("branches-cleanup-plan", help="Branch Cleanup Advisor: identify branches safe to delete (advisory only).")
+    p.set_defaults(func=cmd_branches_cleanup_plan)
+
+    p = sub.add_parser("issue-plan", help="Issue-to-Branch Workflow: turn a GitHub issue into a safe local branch plan (advisory only).")
+    p.add_argument("number", type=int, help="Issue number to plan from.")
+    p.set_defaults(func=cmd_issue_plan)
+
+    p = sub.add_parser("security-summary", help="Summarize GitHub security posture (read-only).")
+    p.set_defaults(func=cmd_security_summary)
+
+    p = sub.add_parser("branch-protection", help="Inspect branch protection rules (read-only).")
+    p.add_argument("branch", help="Branch name to inspect (e.g. main).")
+    p.set_defaults(func=cmd_branch_protection)
+
+
+    p = sub.add_parser("dashboard", help="Terminal UI Dashboard: compact overview for Termius/iPhone (read-only).")
+    p.add_argument("--json", dest="json_output", action="store_true",
+                   help="Output stable JSON for agent/script consumption.")
+    p.set_defaults(func=cmd_dashboard)
 
     return parser
 

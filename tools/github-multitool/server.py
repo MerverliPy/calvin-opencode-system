@@ -6,10 +6,21 @@ Read-only MVP endpoints:
 - GET /health
 - GET /repo/status
 - GET /prs
+- GET /prs/dashboard
 - GET /issues
 - GET /branches
 - GET /runs
+- GET /runs/failed
 - GET /pr/<number>
+- GET /pr/<number>/readiness
+- GET /run/<run_id>/explain
+- GET /security/summary
+- GET /branch/<branch>/protection
+
+Write endpoints (deferred/disabled):
+- POST /pr/create    — CLI command exists (pr-create) but server endpoint is
+                       intentionally disabled. Enable write tools in config and
+                       use the CLI directly.
 
 Security model:
 - Binds only to localhost / 127.0.0.1.
@@ -25,7 +36,7 @@ import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from config_validation import ConfigError, validate_config
 
@@ -98,13 +109,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(status, {"ok": False, "error": message})
 
     def do_POST(self) -> None:
-        self.reject(405, "Write endpoints are disabled in the read-only MVP.")
+        self.reject(405, "Write endpoints are disabled in the read-only MVP. POST /pr/create is deferred.")
 
     def do_PUT(self) -> None:
-        self.reject(405, "Write endpoints are disabled in the read-only MVP.")
+        self.reject(405, "Write endpoints are disabled in the read-only MVP. POST /pr/create is deferred.")
 
     def do_DELETE(self) -> None:
-        self.reject(405, "Write endpoints are disabled in the read-only MVP.")
+        self.reject(405, "Write endpoints are disabled in the read-only MVP. POST /pr/create is deferred.")
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -133,8 +144,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200 if code == 0 else 500, payload)
             return
 
+        if path == "/prs/dashboard":
+            code, payload = run_cli([*base_args, "pr-dashboard", "--limit", limit])
+            self.send_json(200 if code == 0 else 500, payload)
+            return
+
         if path == "/prs":
             code, payload = run_cli([*base_args, "prs-list", "--state", state, "--limit", limit])
+            self.send_json(200 if code == 0 else 500, payload)
+            return
+
+        # PR readiness must be checked before the generic /pr/<number> handler
+        if path.startswith("/pr/") and path.endswith("/readiness"):
+            parts = path.split("/")
+            if len(parts) < 4 or not parts[2].isdigit():
+                self.reject(400, "PR number must be numeric.")
+                return
+            code, payload = run_cli([*base_args, "pr-readiness", parts[2]])
             self.send_json(200 if code == 0 else 500, payload)
             return
 
@@ -159,6 +185,38 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/runs":
             code, payload = run_cli([*base_args, "runs-list", "--limit", limit])
+            self.send_json(200 if code == 0 else 500, payload)
+            return
+
+        if path == "/runs/failed":
+            code, payload = run_cli([*base_args, "runs-failed", "--limit", limit])
+            self.send_json(200 if code == 0 else 500, payload)
+            return
+
+        if path.startswith("/run/") and path.endswith("/explain"):
+            parts = path.split("/")
+            if len(parts) < 4 or not parts[2].isdigit():
+                self.reject(400, "Run ID must be numeric.")
+                return
+            run_id = parts[2]
+            log_lines = first(query, "log_lines", "80")
+            code, payload = run_cli([*base_args, "run-explain", run_id, "--log-lines", log_lines])
+            self.send_json(200 if code == 0 else 500, payload)
+            return
+
+        if path == "/security/summary":
+            code, payload = run_cli([*base_args, "security-summary"])
+            self.send_json(200 if code == 0 else 500, payload)
+            return
+
+        if path.startswith("/branch/") and path.endswith("/protection"):
+            parts = path.split("/")
+            if len(parts) < 4 or not parts[2]:
+                self.reject(400, "Branch name is required.")
+                return
+            raw_branch = parts[2]
+            branch = unquote(raw_branch)
+            code, payload = run_cli([*base_args, "branch-protection", branch])
             self.send_json(200 if code == 0 else 500, payload)
             return
 
